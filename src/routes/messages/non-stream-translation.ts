@@ -1,3 +1,5 @@
+import { isGptModel } from "~/lib/models"
+import { resolveRequestedModel } from "~/lib/slot-routing"
 import {
   type ChatCompletionResponse,
   type ChatCompletionsPayload,
@@ -14,8 +16,8 @@ import {
   type AnthropicMessage,
   type AnthropicMessagesPayload,
   type AnthropicResponse,
-  type AnthropicTextBlock,
   type AnthropicThinkingBlock,
+  type AnthropicTextBlock,
   type AnthropicTool,
   type AnthropicToolResultBlock,
   type AnthropicToolUseBlock,
@@ -24,16 +26,26 @@ import {
 } from "./anthropic-types"
 import { mapOpenAIStopReasonToAnthropic } from "./utils"
 
+export interface OpenAITranslationResult {
+  payload: ChatCompletionsPayload
+  providerIdOverride?: string
+}
+
 // Payload translation
 
 export function translateToOpenAI(
   payload: AnthropicMessagesPayload,
-): ChatCompletionsPayload {
-  return {
-    model: translateModelName(payload.model),
+): OpenAITranslationResult {
+  const route = resolveRequestedModel(payload.model)
+  const targetModel = route.model
+  const isGpt = isGptModel(targetModel)
+
+  const translated: ChatCompletionsPayload = {
+    model: translateModelName(targetModel),
     messages: translateAnthropicMessagesToOpenAI(
       payload.messages,
       payload.system,
+      isGpt,
     ),
     max_tokens: payload.max_tokens,
     stop: payload.stop_sequences,
@@ -44,28 +56,51 @@ export function translateToOpenAI(
     tools: translateAnthropicToolsToOpenAI(payload.tools),
     tool_choice: translateAnthropicToolChoiceToOpenAI(payload.tool_choice),
   }
+
+  return {
+    payload: translated,
+    providerIdOverride: route.providerId,
+  }
 }
 
+/**
+ * Strips version/date suffixes from model IDs so they match the format
+ * that GitHub Copilot expects (e.g. `claude-sonnet-4-20250514` → `claude-sonnet-4`).
+ */
 function translateModelName(model: string): string {
-  // Subagent requests use a specific model number which Copilot doesn't support
+  // Claude model version stripping
   if (model.startsWith("claude-sonnet-4-")) {
     return model.replace(/^claude-sonnet-4-.*/, "claude-sonnet-4")
   } else if (model.startsWith("claude-opus-")) {
     return model.replace(/^claude-opus-4-.*/, "claude-opus-4")
+  } else if (model.startsWith("claude-haiku-")) {
+    return model.replace(/^claude-haiku-4-5-.*/, "claude-haiku-4-5")
   }
+
+  // GPT model version stripping (e.g. gpt-4.1-2025-04-14 → gpt-4.1)
+  if (model.startsWith("gpt-")) {
+    return model.replace(/^(gpt-[a-z0-9.]+)-\d{4}-.*/, "$1")
+  }
+
+  // OpenAI o-series models (e.g. o3-2025-04-16 → o3)
+  if (model.startsWith("o")) {
+    return model.replace(/^(o\d+[a-z-]*)-\d{4}-.*/, "$1")
+  }
+
   return model
 }
 
 function translateAnthropicMessagesToOpenAI(
   anthropicMessages: Array<AnthropicMessage>,
   system: string | Array<AnthropicTextBlock> | undefined,
+  isGpt: boolean = false,
 ): Array<Message> {
   const systemMessages = handleSystemPrompt(system)
 
   const otherMessages = anthropicMessages.flatMap((message) =>
     message.role === "user" ?
-      handleUserMessage(message)
-    : handleAssistantMessage(message),
+      handleUserMessage(message, isGpt)
+    : handleAssistantMessage(message, isGpt),
   )
 
   return [...systemMessages, ...otherMessages]
@@ -86,7 +121,10 @@ function handleSystemPrompt(
   }
 }
 
-function handleUserMessage(message: AnthropicUserMessage): Array<Message> {
+function handleUserMessage(
+  message: AnthropicUserMessage,
+  isGpt: boolean = false,
+): Array<Message> {
   const newMessages: Array<Message> = []
 
   if (Array.isArray(message.content)) {
@@ -103,34 +141,43 @@ function handleUserMessage(message: AnthropicUserMessage): Array<Message> {
       newMessages.push({
         role: "tool",
         tool_call_id: block.tool_use_id,
-        content: mapContent(block.content),
+        content: mapContent(block.content, isGpt),
       })
     }
 
     if (otherBlocks.length > 0) {
       newMessages.push({
         role: "user",
-        content: mapContent(otherBlocks),
+        content: mapContent(otherBlocks, isGpt),
       })
     }
   } else {
     newMessages.push({
       role: "user",
-      content: mapContent(message.content),
+      content: mapContent(message.content, isGpt),
     })
   }
 
   return newMessages
 }
 
+/**
+ * Converts an Anthropic assistant message to OpenAI format.
+ *
+ * For GPT models, thinking blocks are stripped because GPT uses an
+ * internal reasoning format that doesn't map to Anthropic's thinking blocks.
+ * For Claude / Gemini models, thinking blocks are merged into text content
+ * since the downstream Copilot API accepts them.
+ */
 function handleAssistantMessage(
   message: AnthropicAssistantMessage,
+  isGpt: boolean = false,
 ): Array<Message> {
   if (!Array.isArray(message.content)) {
     return [
       {
         role: "assistant",
-        content: mapContent(message.content),
+        content: mapContent(message.content, isGpt),
       },
     ]
   }
@@ -144,42 +191,50 @@ function handleAssistantMessage(
   )
 
   const thinkingBlocks = message.content.filter(
-    (block): block is AnthropicThinkingBlock => block.type === "thinking",
+    (block) => block.type === "thinking",
   )
 
-  // Combine text and thinking blocks, as OpenAI doesn't have separate thinking blocks
-  const allTextContent = [
-    ...textBlocks.map((b) => b.text),
-    ...thinkingBlocks.map((b) => b.thinking),
-  ].join("\n\n")
-
-  return toolUseBlocks.length > 0 ?
-      [
-        {
-          role: "assistant",
-          content: allTextContent || null,
-          tool_calls: toolUseBlocks.map((toolUse) => ({
-            id: toolUse.id,
-            type: "function",
-            function: {
-              name: toolUse.name,
-              arguments: JSON.stringify(toolUse.input),
-            },
-          })),
-        },
-      ]
+  // For GPT models, strip thinking blocks — they have no equivalent format.
+  // For other models, merge thinking into the text content.
+  const allTextContent =
+    isGpt ?
+      textBlocks.map((b) => b.text).join("\n\n")
     : [
-        {
-          role: "assistant",
-          content: mapContent(message.content),
-        },
-      ]
+        ...textBlocks.map((b) => b.text),
+        ...thinkingBlocks.map((b) => (b as { thinking: string }).thinking),
+      ].join("\n\n")
+
+  if (toolUseBlocks.length > 0) {
+    return [
+      {
+        role: "assistant",
+        content: allTextContent || null,
+        tool_calls: toolUseBlocks.map((toolUse) => ({
+          id: toolUse.id,
+          type: "function",
+          function: {
+            name: toolUse.name,
+            arguments: JSON.stringify(toolUse.input),
+          },
+        })),
+      },
+    ]
+  }
+
+  // No tool calls — return merged content as a string
+  return [
+    {
+      role: "assistant",
+      content: mapContent(message.content, isGpt),
+    },
+  ]
 }
 
 function mapContent(
   content:
     | string
     | Array<AnthropicUserContentBlock | AnthropicAssistantContentBlock>,
+  isGpt: boolean = false,
 ): string | Array<ContentPart> | null {
   if (typeof content === "string") {
     return content
@@ -188,9 +243,13 @@ function mapContent(
     return null
   }
 
-  const hasImage = content.some((block) => block.type === "image")
+  // For GPT models, exclude thinking blocks from output
+  const effectiveContent =
+    isGpt ? content.filter((block) => block.type !== "thinking") : content
+
+  const hasImage = effectiveContent.some((block) => block.type === "image")
   if (!hasImage) {
-    return content
+    return effectiveContent
       .filter(
         (block): block is AnthropicTextBlock | AnthropicThinkingBlock =>
           block.type === "text" || block.type === "thinking",
@@ -200,15 +259,10 @@ function mapContent(
   }
 
   const contentParts: Array<ContentPart> = []
-  for (const block of content) {
+  for (const block of effectiveContent) {
     switch (block.type) {
       case "text": {
         contentParts.push({ type: "text", text: block.text })
-
-        break
-      }
-      case "thinking": {
-        contentParts.push({ type: "text", text: block.thinking })
 
         break
       }

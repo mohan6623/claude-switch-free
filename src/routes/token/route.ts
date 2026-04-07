@@ -6,8 +6,19 @@ export const tokenRoute = new Hono()
 
 tokenRoute.get("/", (c) => {
   try {
+    if (state.provider.mode !== "copilot") {
+      return c.json({
+        token: null,
+        provider: state.provider.id,
+        providerMode: state.provider.mode,
+        hasProviderApiKey: Boolean(state.provider.apiKey),
+      })
+    }
+
     return c.json({
       token: state.copilotToken,
+      provider: state.provider.id,
+      providerMode: state.provider.mode,
     })
   } catch (error) {
     console.error("Error fetching token:", error)

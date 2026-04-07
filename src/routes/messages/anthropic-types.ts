@@ -196,6 +196,7 @@ export interface AnthropicStreamState {
   messageStartSent: boolean
   contentBlockIndex: number
   contentBlockOpen: boolean
+  messageTerminalSent: boolean
   toolCalls: {
     [openAIToolIndex: number]: {
       id: string

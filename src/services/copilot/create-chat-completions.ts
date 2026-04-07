@@ -3,11 +3,19 @@ import { events } from "fetch-event-stream"
 
 import { copilotHeaders, copilotBaseUrl } from "~/lib/api-config"
 import { HTTPError } from "~/lib/error"
+import type { ProviderConfig } from "~/lib/provider-config"
 import { state } from "~/lib/state"
 
 export const createChatCompletions = async (
   payload: ChatCompletionsPayload,
+  providerOverride?: ProviderConfig,
 ) => {
+  const effectiveProvider = providerOverride || state.provider
+
+  if (effectiveProvider.mode === "openai-compatible") {
+    return await createOpenAICompatibleChatCompletions(payload, effectiveProvider)
+  }
+
   if (!state.copilotToken) throw new Error("Copilot token not found")
 
   const enableVision = payload.messages.some(
@@ -31,6 +39,39 @@ export const createChatCompletions = async (
   const response = await fetch(`${copilotBaseUrl(state)}/chat/completions`, {
     method: "POST",
     headers,
+    body: JSON.stringify(payload),
+  })
+
+  if (!response.ok) {
+    consola.error("Failed to create chat completions", response)
+    throw new HTTPError("Failed to create chat completions", response)
+  }
+
+  if (payload.stream) {
+    return events(response)
+  }
+
+  return (await response.json()) as ChatCompletionResponse
+}
+
+async function createOpenAICompatibleChatCompletions(
+  payload: ChatCompletionsPayload,
+  provider: ProviderConfig,
+) {
+  if (!provider.baseUrl || !provider.apiKey) {
+    throw new Error(
+      "Provider mode is enabled but base URL or API key is missing",
+    )
+  }
+
+  const response = await fetch(`${provider.baseUrl}/chat/completions`, {
+    method: "POST",
+    headers: {
+      accept: "application/json",
+      "content-type": "application/json",
+      authorization: `Bearer ${provider.apiKey}`,
+      ...(provider.headers || {}),
+    },
     body: JSON.stringify(payload),
   })
 

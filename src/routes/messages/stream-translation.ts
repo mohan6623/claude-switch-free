@@ -142,7 +142,7 @@ export function translateChunkToAnthropicEvents(
     }
   }
 
-  if (choice.finish_reason) {
+  if (choice.finish_reason && !state.messageTerminalSent) {
     if (state.contentBlockOpen) {
       events.push({
         type: "content_block_stop",
@@ -174,6 +174,7 @@ export function translateChunkToAnthropicEvents(
         type: "message_stop",
       },
     )
+    state.messageTerminalSent = true
   }
 
   return events

@@ -6,6 +6,7 @@ import { auth } from "./auth"
 import { checkUsage } from "./check-usage"
 import { debug } from "./debug"
 import { start } from "./start"
+import { switchCommand } from "./switch"
 
 const main = defineCommand({
   meta: {
@@ -13,7 +14,13 @@ const main = defineCommand({
     description:
       "A wrapper around GitHub Copilot API to make it OpenAI compatible, making it usable for other tools.",
   },
-  subCommands: { auth, start, "check-usage": checkUsage, debug },
+  subCommands: {
+    auth,
+    start,
+    switch: switchCommand,
+    "check-usage": checkUsage,
+    debug,
+  },
 })
 
 await runMain(main)

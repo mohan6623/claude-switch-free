@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 
+import { search as promptSearchSelect } from "@inquirer/prompts"
 import { defineCommand } from "citty"
 import clipboard from "clipboardy"
 import consola from "consola"
@@ -7,12 +8,48 @@ import { serve, type ServerHandler } from "srvx"
 import invariant from "tiny-invariant"
 
 import { ensurePaths } from "./lib/paths"
+import { syncClaudeSettingsLocal } from "./lib/claude-settings"
+import {
+  resolveProviderConfig,
+  type ResolveProviderOptions,
+} from "./lib/provider-config"
 import { initProxyFromEnv } from "./lib/proxy"
 import { generateEnvScript } from "./lib/shell"
 import { state } from "./lib/state"
+import {
+  getActiveProviderProfile,
+  getProviderProfile,
+  loadStartupConfig,
+  saveStartupConfig,
+  setActiveProvider,
+  upsertProviderProfile,
+  type ProviderProfile,
+} from "./lib/startup-config"
+import { applyModelSlotDraft } from "./lib/switch-model-draft"
+import {
+  decodeRoutedModel,
+  encodeRoutedModel,
+  summarizeRoutedModel,
+} from "./lib/slot-routing"
+import {
+  buildProviderDisplayLabel,
+  buildSearchStatusLabel,
+  buildClaudeModelEnv,
+  buildClaudeModelSlotEnv,
+  getFeaturedModelCandidates,
+  getCopilotModelIds,
+  getProviderPresets,
+  hasCompleteModelSlots,
+  normalizeModelSlots,
+  summarizeModelSlots,
+  shouldReuseSavedModels,
+  type ModelSlots,
+} from "./lib/startup-wizard"
+import { persistSwitchConfig } from "./lib/switch-persistence"
 import { setupCopilotToken, setupGitHubToken } from "./lib/token"
 import { cacheModels, cacheVSCodeVersion } from "./lib/utils"
 import { server } from "./server"
+import { getCopilotToken } from "./services/github/get-copilot-token"
 
 interface RunServerOptions {
   port: number
@@ -25,12 +62,96 @@ interface RunServerOptions {
   claudeCode: boolean
   showToken: boolean
   proxyEnv: boolean
+  provider?: string
+  providerBaseUrl?: string
+  providerApiKey?: string
+  providerModel?: string
+  providerSmallModel?: string
+}
+
+interface StartupSelection {
+  providerOptions: ResolveProviderOptions
+  modelSlots?: ModelSlots
+}
+
+interface ProviderChoice {
+  id: string
+  label: string
+  baseUrl: string
+  apiKeyUrl?: string
+  isPreset: boolean
+  existingProfile?: ProviderProfile
+}
+
+interface SearchableOption {
+  value: string
+  label: string
+  description?: string
+  searchText?: string
+}
+
+type PromptSpacing = "major" | "minor" | "none"
+
+const ADD_CUSTOM_PROVIDER_LABEL = "Add custom provider"
+const PROVIDER_ACTION_CONTINUE = "Continue with current config"
+const PROVIDER_ACTION_ADD = "Add provider"
+const PROVIDER_ACTION_UPDATE = "Update provider"
+const PROVIDER_ACTION_SWITCH = "Switch configured provider/model"
+const FALLBACK_MODEL = "qwen/qwen3.6-plus:free"
+const DOUBLE_ESCAPE_WINDOW_MS = 850
+
+class PromptBackError extends Error {
+  constructor() {
+    super("Prompt back")
+    this.name = "PromptBackError"
+  }
+}
+
+class PromptExitError extends Error {
+  constructor() {
+    super("Prompt exit")
+    this.name = "PromptExitError"
+  }
+}
+
+let lastPromptCancelAt = 0
+
+async function syncClaudeSettingsFromStartupConfig(
+  config: Awaited<ReturnType<typeof loadStartupConfig>>,
+): Promise<void> {
+  const active = getActiveProviderProfile(config)
+  if (!active || !hasCompleteModelSlots(active.modelSlots)) {
+    return
+  }
+
+  const result = await syncClaudeSettingsLocal(
+    process.cwd(),
+    buildClaudeModelSlotEnv(normalizeModelSlots(active.modelSlots)),
+  )
+
+  if (result.updated && result.path) {
+    consola.info(`Synced Claude settings: ${result.path}`)
+  }
 }
 
 export async function runServer(options: RunServerOptions): Promise<void> {
   if (options.proxyEnv) {
     initProxyFromEnv()
   }
+
+  await ensurePaths()
+
+  const startupSelection = await resolveStartupSelection(options)
+
+  state.provider = resolveProviderConfig({
+    provider: startupSelection.providerOptions.provider,
+    providerBaseUrl: startupSelection.providerOptions.providerBaseUrl,
+    providerApiKey: startupSelection.providerOptions.providerApiKey,
+    providerModel: startupSelection.providerOptions.providerModel,
+    providerSmallModel: startupSelection.providerOptions.providerSmallModel,
+  })
+
+  const copilotRouted = hasCopilotRoutedSlot(startupSelection.modelSlots)
 
   if (options.verbose) {
     consola.level = 5
@@ -47,55 +168,86 @@ export async function runServer(options: RunServerOptions): Promise<void> {
   state.rateLimitWait = options.rateLimitWait
   state.showToken = options.showToken
 
-  await ensurePaths()
-  await cacheVSCodeVersion()
+  if (state.provider.mode === "copilot" || copilotRouted) {
+    await cacheVSCodeVersion()
 
-  if (options.githubToken) {
-    state.githubToken = options.githubToken
-    consola.info("Using provided GitHub token")
-  } else {
-    await setupGitHubToken()
+    if (options.githubToken) {
+      state.githubToken = options.githubToken
+      consola.info("Using provided GitHub token")
+    } else {
+      await setupGitHubToken()
+    }
+
+    await setupCopilotToken()
   }
 
-  await setupCopilotToken()
+  if (state.provider.mode !== "copilot") {
+    consola.info(
+      `Using provider ${state.provider.id} via ${state.provider.baseUrl}`,
+    )
+
+    if (copilotRouted) {
+      consola.info("Copilot Pro routing enabled for one or more Claude slots")
+    }
+  }
+
   await cacheModels()
 
-  consola.info(
-    `Available models: \n${state.models?.data.map((model) => `- ${model.id}`).join("\n")}`,
-  )
+  if (state.provider.mode === "openai-compatible") {
+    const configuredSlots = startupSelection.modelSlots
+      || deriveModelSlotsFromProviderPreferences()
+
+    if (configuredSlots) {
+      consola.info(`Configured models: ${summarizeModelSlots(configuredSlots)}`)
+    } else {
+      consola.info(
+        `Configured provider ${state.provider.id}${state.provider.preferredModel ? ` with default=${state.provider.preferredModel}` : ""}`,
+      )
+    }
+  } else if (options.verbose) {
+    consola.info(
+      `Available models: \n${state.models?.data.map((model) => `- ${model.id}`).join("\n")}`,
+    )
+  }
 
   const serverUrl = `http://localhost:${options.port}`
 
   if (options.claudeCode) {
     invariant(state.models, "Models should be loaded by now")
 
-    const selectedModel = await consola.prompt(
-      "Select a model to use with Claude Code",
-      {
-        type: "select",
-        options: state.models.data.map((model) => model.id),
-      },
+    const modelOptions = state.models.data.map((model) => model.id)
+
+    const selectedSlots =
+      startupSelection.modelSlots
+      || normalizeModelSlots({
+        defaultModel:
+          state.provider.preferredModel || modelOptions[0] || FALLBACK_MODEL,
+        bigModel:
+          state.provider.preferredModel || modelOptions[0] || FALLBACK_MODEL,
+        sonnetModel:
+          state.provider.preferredModel || modelOptions[0] || FALLBACK_MODEL,
+        haikuModel:
+          state.provider.preferredSmallModel
+          || state.provider.preferredModel
+          || modelOptions[0]
+          || FALLBACK_MODEL,
+      })
+
+    consola.info(
+      `Claude model slots: default=${selectedSlots.defaultModel}, opus=${selectedSlots.bigModel}, sonnet=${selectedSlots.sonnetModel}, haiku=${selectedSlots.haikuModel}`,
     )
 
-    const selectedSmallModel = await consola.prompt(
-      "Select a small model to use with Claude Code",
-      {
-        type: "select",
-        options: state.models.data.map((model) => model.id),
-      },
-    )
+    const claudeEnv = buildClaudeModelEnv(serverUrl, selectedSlots)
+
+    const syncResult = await syncClaudeSettingsLocal(process.cwd(), claudeEnv)
+    if (syncResult.updated && syncResult.path) {
+      consola.info(`Synced Claude settings: ${syncResult.path}`)
+    } else {
+      consola.warn("No .claude/settings.local.json found to sync from current workspace path.")
+    }
 
     const command = generateEnvScript(
-      {
-        ANTHROPIC_BASE_URL: serverUrl,
-        ANTHROPIC_AUTH_TOKEN: "dummy",
-        ANTHROPIC_MODEL: selectedModel,
-        ANTHROPIC_DEFAULT_SONNET_MODEL: selectedModel,
-        ANTHROPIC_SMALL_FAST_MODEL: selectedSmallModel,
-        ANTHROPIC_DEFAULT_HAIKU_MODEL: selectedSmallModel,
-        DISABLE_NON_ESSENTIAL_MODEL_CALLS: "1",
-        CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1",
-      },
+      claudeEnv,
       "claude",
     )
 
@@ -118,6 +270,1249 @@ export async function runServer(options: RunServerOptions): Promise<void> {
     fetch: server.fetch as ServerHandler,
     port: options.port,
   })
+}
+
+async function resolveStartupSelection(
+  options: RunServerOptions,
+): Promise<StartupSelection> {
+  if (hasExplicitProviderConfiguration(options) || !process.stdin.isTTY) {
+    return {
+      providerOptions: {
+        provider: options.provider,
+        providerBaseUrl: options.providerBaseUrl,
+        providerApiKey: options.providerApiKey,
+        providerModel: options.providerModel,
+        providerSmallModel: options.providerSmallModel,
+      },
+    }
+  }
+
+  const savedSelection = await resolveSavedStartupSelection()
+  if (savedSelection) {
+    return savedSelection
+  }
+
+  return {
+    providerOptions: {
+      provider: "copilot",
+    },
+  }
+}
+
+async function resolveSavedStartupSelection(): Promise<StartupSelection | undefined> {
+  const startupConfig = await loadStartupConfig()
+  const active = getActiveProviderProfile(startupConfig)
+
+  if (!active) {
+    return undefined
+  }
+
+  if (hasCompleteModelSlots(active.modelSlots)) {
+    return buildSelectionFromProfile(active, normalizeModelSlots(active.modelSlots))
+  }
+
+  return {
+    providerOptions: {
+      provider: active.isPreset ? active.id : "custom",
+      providerBaseUrl: active.baseUrl,
+      providerApiKey: active.apiKey,
+    },
+  }
+}
+
+export async function runSwitchConfiguration(): Promise<void> {
+  await ensurePaths()
+
+  let workingConfig = await loadStartupConfig()
+
+  if (workingConfig.providers.length === 0) {
+    consola.warn("No providers configured yet. Add a provider first in switch mode.")
+    const added = await runAddProviderFlow(workingConfig)
+    workingConfig = await loadStartupConfig()
+    consola.info(`Initialized with provider ${added.providerOptions.provider || "custom"}`)
+  }
+
+  let dirty = false
+
+  while (true) {
+    const active = getActiveProviderProfile(workingConfig)
+    const activeLabel = active
+      ? `${active.label} (${active.id})`
+      : "none"
+
+    let action: string
+    try {
+      action = await promptSelect(
+        `Switch configuration mode (active provider: ${activeLabel})`,
+        [
+          PROVIDER_ACTION_CONTINUE,
+          PROVIDER_ACTION_ADD,
+          PROVIDER_ACTION_UPDATE,
+          PROVIDER_ACTION_SWITCH,
+          "Change model mappings",
+          "Save and exit",
+          "Exit",
+        ],
+        PROVIDER_ACTION_CONTINUE,
+        { spacing: "major" },
+      )
+    } catch (error) {
+      if (error instanceof PromptBackError) {
+        continue
+      }
+
+      if (error instanceof PromptExitError) {
+        if (!dirty) {
+          return
+        }
+
+        const exitDecision = await promptSelect(
+          "Unsaved changes detected. What do you want to do?",
+          [
+            "Save changes and exit",
+            "Discard changes and exit",
+            "Back",
+          ],
+          "Back",
+          { spacing: "minor" },
+        )
+
+        if (exitDecision === "Save changes and exit") {
+          await persistSwitchConfig({
+            config: workingConfig,
+            sync: syncClaudeSettingsFromStartupConfig,
+            save: saveStartupConfig,
+          })
+          consola.success("Saved switch configuration.")
+          return
+        }
+
+        if (exitDecision === "Discard changes and exit") {
+          consola.info("Discarded unsaved switch changes.")
+          return
+        }
+
+        continue
+      }
+
+      throw error
+    }
+
+    if (action === "Change model mappings") {
+      let result
+      try {
+        result = await runChangeModelDraft(workingConfig)
+      } catch (error) {
+        if (error instanceof PromptBackError) {
+          continue
+        }
+
+        if (error instanceof PromptExitError) {
+          if (!dirty) {
+            return
+          }
+
+          const exitDecision = await promptSelect(
+            "Unsaved changes detected. What do you want to do?",
+            [
+              "Save changes and exit",
+              "Discard changes and exit",
+              "Back",
+            ],
+            "Back",
+            { spacing: "minor" },
+          )
+
+          if (exitDecision === "Save changes and exit") {
+            await persistSwitchConfig({
+              config: workingConfig,
+              sync: syncClaudeSettingsFromStartupConfig,
+              save: saveStartupConfig,
+            })
+            consola.success("Saved switch configuration.")
+            return
+          }
+
+          if (exitDecision === "Discard changes and exit") {
+            consola.info("Discarded unsaved switch changes.")
+            return
+          }
+
+          continue
+        }
+
+        throw error
+      }
+
+      workingConfig = result.updatedConfig
+      dirty = true
+      continue
+    }
+
+    if (action === PROVIDER_ACTION_CONTINUE) {
+      await runContinueProviderFlow(workingConfig)
+      workingConfig = await loadStartupConfig()
+      dirty = false
+      continue
+    }
+
+    if (action === PROVIDER_ACTION_ADD) {
+      await runAddProviderFlow(workingConfig)
+      workingConfig = await loadStartupConfig()
+      dirty = false
+      continue
+    }
+
+    if (action === PROVIDER_ACTION_UPDATE) {
+      await runUpdateProviderFlow(workingConfig)
+      workingConfig = await loadStartupConfig()
+      dirty = false
+      continue
+    }
+
+    if (action === PROVIDER_ACTION_SWITCH) {
+      await runSwitchProviderFlow(workingConfig)
+      workingConfig = await loadStartupConfig()
+      dirty = false
+      continue
+    }
+
+    if (action === "Save and exit") {
+      if (dirty) {
+        await persistSwitchConfig({
+          config: workingConfig,
+          sync: syncClaudeSettingsFromStartupConfig,
+          save: saveStartupConfig,
+        })
+        consola.success("Saved switch configuration.")
+      } else {
+        consola.info("No changes to save.")
+      }
+      return
+    }
+
+    if (!dirty) {
+      return
+    }
+
+    const exitDecision = await promptSelect(
+      "Unsaved changes detected. What do you want to do?",
+      [
+        "Save changes and exit",
+        "Discard changes and exit",
+        "Back",
+      ],
+      "Back",
+      { spacing: "minor" },
+    )
+
+    if (exitDecision === "Save changes and exit") {
+      await persistSwitchConfig({
+        config: workingConfig,
+        sync: syncClaudeSettingsFromStartupConfig,
+        save: saveStartupConfig,
+      })
+      consola.success("Saved switch configuration.")
+      return
+    }
+
+    if (exitDecision === "Discard changes and exit") {
+      consola.info("Discarded unsaved switch changes.")
+      return
+    }
+  }
+}
+
+async function runChangeModelDraft(
+  startupConfig: Awaited<ReturnType<typeof loadStartupConfig>>,
+): Promise<{
+  updatedConfig: Awaited<ReturnType<typeof loadStartupConfig>>
+  activeProfile: ProviderProfile
+  modelSlots: ModelSlots
+}> {
+  const active = getActiveProviderProfile(startupConfig)
+  if (!active) {
+    throw new Error("No active provider found. Add a provider before changing model slots.")
+  }
+
+  let modelSlots = hasCompleteModelSlots(active.modelSlots)
+    ? normalizeModelSlots(active.modelSlots)
+    : normalizeModelSlots({
+      defaultModel: active.id === "openrouter" ? "qwen/qwen3.6-plus:free" : FALLBACK_MODEL,
+      bigModel: active.id === "openrouter" ? "qwen/qwen3.6-plus:free" : FALLBACK_MODEL,
+      sonnetModel: active.id === "openrouter" ? "qwen/qwen3.6-plus:free" : FALLBACK_MODEL,
+      haikuModel: active.id === "openrouter" ? "qwen/qwen3.6-plus:free" : FALLBACK_MODEL,
+    })
+
+  let updatedSlots = { ...modelSlots }
+
+  while (true) {
+    let slotSelection: string
+    try {
+      slotSelection = await promptSelect(
+        "Select slot to change",
+        [
+          `default (${summarizeRoutedModel(updatedSlots.defaultModel)})`,
+          `opus (${summarizeRoutedModel(updatedSlots.bigModel)})`,
+          `sonnet (${summarizeRoutedModel(updatedSlots.sonnetModel)})`,
+          `haiku (${summarizeRoutedModel(updatedSlots.haikuModel)})`,
+          "Done",
+        ],
+        "Done",
+        { spacing: "major" },
+      )
+    } catch (error) {
+      if (error instanceof PromptBackError) {
+        return {
+          updatedConfig: startupConfig,
+          activeProfile: active,
+          modelSlots,
+        }
+      }
+      throw error
+    }
+
+    if (slotSelection === "Done") {
+      break
+    }
+
+    const slot = parseSlotLabel(slotSelection)
+    const currentValue = getSlotModel(updatedSlots, slot)
+    const currentRoute = decodeRoutedModel(currentValue)
+
+    let selectedProviderId: string
+    try {
+      selectedProviderId = await promptSlotProvider(
+        startupConfig.providers,
+        currentRoute?.providerId || active.id,
+      )
+    } catch (error) {
+      if (error instanceof PromptBackError) {
+        continue
+      }
+      throw error
+    }
+
+    let selectedModel: string
+    try {
+      selectedModel = await promptModelForProviderSlot(
+        startupConfig,
+        selectedProviderId,
+        currentRoute?.model || currentValue,
+        slot,
+      )
+    } catch (error) {
+      if (error instanceof PromptBackError) {
+        continue
+      }
+      throw error
+    }
+
+    updatedSlots = setSlotModel(
+      updatedSlots,
+      slot,
+      encodeRoutedModel(selectedProviderId, selectedModel),
+    )
+  }
+
+  modelSlots = normalizeModelSlots(updatedSlots)
+  const updatedConfig = applyModelSlotDraft(startupConfig, active, modelSlots)
+  const activeProfile = getProviderProfile(updatedConfig, active.id)
+
+  if (!activeProfile) {
+    throw new Error("Unable to persist model slot draft for active provider")
+  }
+
+  return {
+    updatedConfig,
+    activeProfile,
+    modelSlots,
+  }
+}
+
+async function promptSlotProvider(
+  profiles: Array<ProviderProfile>,
+  initialProviderId: string,
+): Promise<string> {
+  const providerOptions: Array<SearchableOption> = [
+    {
+      value: "copilot",
+      label: "Copilot Pro",
+      description: "OAuth-backed GitHub Copilot provider",
+      searchText: "copilot github",
+    },
+    ...[...profiles]
+      .sort((a, b) => a.label.localeCompare(b.label))
+      .map((profile) => ({
+        value: profile.id,
+        label: buildProviderDisplayLabel({
+          label: profile.label,
+          baseUrl: profile.baseUrl,
+        }),
+        description: profile.baseUrl,
+        searchText: `${profile.id} ${profile.label} ${profile.baseUrl}`,
+      })),
+  ]
+
+  return await promptSelect(
+    "Search provider for slot",
+    providerOptions,
+    providerOptions.some((option) => option.value === initialProviderId)
+      ? initialProviderId
+      : providerOptions[0]?.value,
+    { spacing: "minor" },
+  )
+}
+
+async function promptModelForProviderSlot(
+  startupConfig: Awaited<ReturnType<typeof loadStartupConfig>>,
+  providerId: string,
+  initialModel: string,
+  slot: "default" | "opus" | "sonnet" | "haiku",
+): Promise<string> {
+  if (providerId === "copilot") {
+    const copilotModels = await fetchCopilotModelsForSlotSelection()
+    if (copilotModels.length > 0) {
+      return await promptModelFromSearch(
+        `Copilot Pro ${slot} model`,
+        copilotModels,
+        initialModel,
+      )
+    }
+
+    consola.warn("Could not load Copilot Pro models. Falling back to manual model entry.")
+    return await promptText(`Enter Copilot model for ${slot}`, initialModel)
+  }
+
+  const profile = startupConfig.providers.find((item) => item.id === providerId)
+  if (!profile) {
+    throw new Error(`Provider ${providerId} is not configured`)
+  }
+
+  const availableModels = await fetchProviderModels(profile.baseUrl, profile.apiKey)
+  if (availableModels.length === 0) {
+    return await promptText(
+      `Enter model id for ${slot}`,
+      initialModel,
+    )
+  }
+
+  return await promptModelFromSearch(
+    `${slot} model`,
+    availableModels,
+    initialModel,
+  )
+}
+
+async function fetchCopilotModelsForSlotSelection(): Promise<Array<string>> {
+  if (state.models?.data?.length) {
+    return getCopilotModelIds(state.models)
+  }
+
+  const previousProvider = state.provider
+
+  try {
+    state.provider = {
+      id: "copilot",
+      mode: "copilot",
+    }
+
+    if (!state.vsCodeVersion) {
+      await cacheVSCodeVersion()
+    }
+
+    if (!state.githubToken) {
+      await setupGitHubToken()
+    }
+
+    if (!state.copilotToken) {
+      const { token } = await getCopilotToken()
+      state.copilotToken = token
+    }
+
+    await cacheModels()
+    return getCopilotModelIds(state.models)
+  } catch (error) {
+    consola.warn("Failed to load Copilot Pro model list for slot selection.", error)
+    return []
+  } finally {
+    state.provider = previousProvider
+  }
+}
+
+async function runContinueProviderFlow(
+  startupConfig: Awaited<ReturnType<typeof loadStartupConfig>>,
+): Promise<StartupSelection> {
+  const active = getActiveProviderProfile(startupConfig)
+
+  if (!active) {
+    return await runAddProviderFlow(startupConfig)
+  }
+
+  const withActive = setActiveProvider(startupConfig, active.id)
+  await persistSwitchConfig({
+    config: withActive,
+    sync: syncClaudeSettingsFromStartupConfig,
+    save: saveStartupConfig,
+  })
+
+  if (!hasCompleteModelSlots(active.modelSlots)) {
+    consola.warn(
+      `Provider ${active.label} is missing model slots. Updating models now.`,
+    )
+    return await runUpdateProviderFlow(withActive, active.id)
+  }
+
+  const modelSlots = normalizeModelSlots(active.modelSlots)
+  consola.info(`Continuing with ${active.label} (${active.baseUrl})`)
+  consola.info(`Selected models: ${summarizeModelSlots(modelSlots)}`)
+
+  return buildSelectionFromProfile(active, modelSlots)
+}
+
+async function runAddProviderFlow(
+  startupConfig: Awaited<ReturnType<typeof loadStartupConfig>>,
+): Promise<StartupSelection> {
+  const providerChoice = await promptProviderChoiceForAdd(startupConfig.providers)
+  const apiKey = await promptProviderApiKey(providerChoice)
+
+  let modelSlots: ModelSlots
+  let keepExistingModels = false
+
+  if (hasCompleteModelSlots(providerChoice.existingProfile?.modelSlots)) {
+    keepExistingModels = await promptConfirm(
+      "Keep previous model slot configuration for this provider?",
+      true,
+    )
+  }
+
+  if (
+    shouldReuseSavedModels(
+      providerChoice.existingProfile?.modelSlots,
+      keepExistingModels,
+    )
+  ) {
+    modelSlots = normalizeModelSlots(providerChoice.existingProfile.modelSlots)
+  } else {
+    const availableModels = await fetchProviderModels(
+      providerChoice.baseUrl,
+      apiKey,
+    )
+    modelSlots = await promptModelSlots(
+      availableModels,
+      providerChoice.existingProfile?.modelSlots,
+    )
+  }
+
+  const updatedProfile: ProviderProfile = {
+    id: providerChoice.id,
+    label: providerChoice.label,
+    baseUrl: providerChoice.baseUrl,
+    apiKey,
+    apiKeyUrl: providerChoice.apiKeyUrl,
+    isPreset: providerChoice.isPreset,
+    modelSlots,
+    updatedAt: new Date().toISOString(),
+  }
+
+  const updatedConfig = setActiveProvider(
+    upsertProviderProfile(startupConfig, updatedProfile),
+    updatedProfile.id,
+  )
+  await persistSwitchConfig({
+    config: updatedConfig,
+    sync: syncClaudeSettingsFromStartupConfig,
+    save: saveStartupConfig,
+  })
+
+  consola.info(`Selected models: ${summarizeModelSlots(modelSlots)}`)
+  return buildSelectionFromProfile(updatedProfile, modelSlots)
+}
+
+async function runUpdateProviderFlow(
+  startupConfig: Awaited<ReturnType<typeof loadStartupConfig>>,
+  providerId?: string,
+): Promise<StartupSelection> {
+  const profile = providerId
+    ? startupConfig.providers.find((provider) => provider.id === providerId)
+    : await promptExistingProviderProfile(
+      startupConfig.providers,
+      "Search provider to update",
+    )
+
+  if (!profile) {
+    throw new Error("No provider available to update")
+  }
+
+  const updateOptions = [
+    "Update API key",
+    "Update model slots",
+    "Update API key and model slots",
+  ]
+
+  const updateSelection = await promptSelect(
+    "What do you want to update?",
+    updateOptions,
+    updateOptions[1],
+    { spacing: "minor" },
+  )
+
+  const shouldUpdateApiKey =
+    updateSelection === "Update API key"
+    || updateSelection === "Update API key and model slots"
+  const shouldUpdateModels =
+    updateSelection === "Update model slots"
+    || updateSelection === "Update API key and model slots"
+
+  const apiKey = shouldUpdateApiKey
+    ? await promptProviderApiKey({
+      id: profile.id,
+      label: profile.label,
+      baseUrl: profile.baseUrl,
+      apiKeyUrl: profile.apiKeyUrl,
+      isPreset: profile.isPreset,
+      existingProfile: profile,
+    })
+    : profile.apiKey
+
+  let modelSlots: ModelSlots
+  if (shouldUpdateModels || !hasCompleteModelSlots(profile.modelSlots)) {
+    const availableModels = await fetchProviderModels(profile.baseUrl, apiKey)
+    modelSlots = await promptModelSlots(availableModels, profile.modelSlots)
+  } else {
+    modelSlots = normalizeModelSlots(profile.modelSlots)
+  }
+
+  const updatedProfile: ProviderProfile = {
+    ...profile,
+    apiKey,
+    modelSlots,
+    updatedAt: new Date().toISOString(),
+  }
+
+  const updatedConfig = setActiveProvider(
+    upsertProviderProfile(startupConfig, updatedProfile),
+    updatedProfile.id,
+  )
+  await persistSwitchConfig({
+    config: updatedConfig,
+    sync: syncClaudeSettingsFromStartupConfig,
+    save: saveStartupConfig,
+  })
+
+  consola.info(`Selected models: ${summarizeModelSlots(modelSlots)}`)
+  return buildSelectionFromProfile(updatedProfile, modelSlots)
+}
+
+async function runSwitchProviderFlow(
+  startupConfig: Awaited<ReturnType<typeof loadStartupConfig>>,
+): Promise<StartupSelection> {
+  const selectedProfile = await promptExistingProviderProfile(
+    startupConfig.providers,
+    "Search configured provider/model",
+  )
+
+  if (!selectedProfile) {
+    throw new Error("No configured provider found")
+  }
+
+  let modelSlots: ModelSlots
+  if (hasCompleteModelSlots(selectedProfile.modelSlots)) {
+    modelSlots = normalizeModelSlots(selectedProfile.modelSlots)
+  } else {
+    const availableModels = await fetchProviderModels(
+      selectedProfile.baseUrl,
+      selectedProfile.apiKey,
+    )
+    modelSlots = await promptModelSlots(availableModels, selectedProfile.modelSlots)
+  }
+
+  const refreshedProfile: ProviderProfile = {
+    ...selectedProfile,
+    modelSlots,
+    updatedAt: new Date().toISOString(),
+  }
+
+  const updatedConfig = setActiveProvider(
+    upsertProviderProfile(startupConfig, refreshedProfile),
+    refreshedProfile.id,
+  )
+  await persistSwitchConfig({
+    config: updatedConfig,
+    sync: syncClaudeSettingsFromStartupConfig,
+    save: saveStartupConfig,
+  })
+
+  consola.info(`Selected models: ${summarizeModelSlots(modelSlots)}`)
+  return buildSelectionFromProfile(refreshedProfile, modelSlots)
+}
+
+async function promptProviderChoiceForAdd(
+  existingProfiles: Array<ProviderProfile>,
+): Promise<ProviderChoice> {
+  const presets = getProviderPresets()
+
+  const options: Array<SearchableOption | string> = [
+    ...presets.map((preset) => ({
+      value: `preset:${preset.id}`,
+      label: buildProviderDisplayLabel({
+        label: preset.label,
+        baseUrl: preset.baseUrl,
+      }),
+      description: "Preset provider",
+      searchText: `${preset.id} ${preset.label} ${preset.baseUrl}`,
+    })),
+    ADD_CUSTOM_PROVIDER_LABEL,
+  ]
+
+  const selected = await promptSelect(
+    "Search provider profile",
+    options,
+    presets[0] ? `preset:${presets[0].id}` : ADD_CUSTOM_PROVIDER_LABEL,
+    { spacing: "major" },
+  )
+
+  if (selected === ADD_CUSTOM_PROVIDER_LABEL) {
+    const customBaseUrl = stripBaseUrl(
+      await promptText("Enter custom provider base URL"),
+    )
+
+    const customId = buildCustomProviderId(customBaseUrl)
+    const existingProfile = getProviderProfile(
+      { version: 1, providers: existingProfiles },
+      customId,
+    )
+
+    return {
+      id: customId,
+      label: `Custom (${customId})`,
+      baseUrl: customBaseUrl,
+      isPreset: false,
+      existingProfile,
+    }
+  }
+
+  const presetValuePrefix = "preset:"
+  if (selected.startsWith(presetValuePrefix)) {
+    const presetId = selected.slice(presetValuePrefix.length)
+    const preset = presets.find((item) => item.id === presetId)
+
+    if (!preset) {
+      throw new Error(`Unable to resolve preset "${presetId}"`)
+    }
+
+    return {
+      id: preset.id,
+      label: preset.label,
+      baseUrl: preset.baseUrl,
+      apiKeyUrl: preset.apiKeyUrl,
+      isPreset: true,
+      existingProfile: getProviderProfile(
+        { version: 1, providers: existingProfiles },
+        preset.id,
+      ),
+    }
+  }
+
+  throw new Error(`Unsupported provider option "${selected}"`)
+}
+
+async function promptExistingProviderProfile(
+  profiles: Array<ProviderProfile>,
+  promptMessage: string,
+): Promise<ProviderProfile | undefined> {
+  if (profiles.length === 0) {
+    return undefined
+  }
+
+  const options: Array<SearchableOption> = profiles.map((profile) => {
+    const slotSummary = hasCompleteModelSlots(profile.modelSlots)
+      ? summarizeModelSlotsForList(normalizeModelSlots(profile.modelSlots))
+      : "models not configured"
+
+    return {
+      value: profile.id,
+      label: buildProviderDisplayLabel({
+        label: profile.label,
+        baseUrl: profile.baseUrl,
+        isActive: false,
+      }),
+      description: slotSummary,
+      searchText: `${profile.id} ${profile.label} ${profile.baseUrl} ${slotSummary}`,
+    }
+  })
+
+  const selectedId = await promptSelect(
+    promptMessage,
+    options,
+    options[0]?.value,
+    { spacing: "major" },
+  )
+  const selectedProfile = profiles.find((profile) => profile.id === selectedId)
+  if (!selectedProfile) {
+    return undefined
+  }
+
+  return selectedProfile
+}
+
+function buildSelectionFromProfile(
+  profile: ProviderProfile,
+  modelSlots: ModelSlots,
+): StartupSelection {
+  return {
+    providerOptions: {
+      provider: profile.isPreset ? profile.id : "custom",
+      providerBaseUrl: profile.baseUrl,
+      providerApiKey: profile.apiKey,
+      providerModel: modelSlots.defaultModel,
+      providerSmallModel: modelSlots.haikuModel,
+    },
+    modelSlots,
+  }
+}
+
+async function promptProviderApiKey(choice: ProviderChoice): Promise<string> {
+  const existingApiKey = choice.existingProfile?.apiKey
+
+  if (existingApiKey) {
+    const keepExisting = await promptConfirm(
+      `Use saved API key for ${choice.label}?`,
+      true,
+    )
+
+    if (keepExisting) {
+      return existingApiKey
+    }
+  }
+
+  if (choice.apiKeyUrl) {
+    consola.info(`Get API key for ${choice.label}: ${choice.apiKeyUrl}`)
+  } else {
+    consola.info(
+      `Enter API key for ${choice.label}. Use your provider dashboard to generate it.`,
+    )
+  }
+
+  return await promptText("Enter provider API key")
+}
+
+async function fetchProviderModels(
+  baseUrl: string,
+  apiKey: string,
+): Promise<Array<string>> {
+  try {
+    const response = await fetch(`${baseUrl}/models`, {
+      headers: {
+        accept: "application/json",
+        authorization: `Bearer ${apiKey}`,
+      },
+    })
+
+    if (!response.ok) {
+      return []
+    }
+
+    const payload = (await response.json()) as {
+      data?: Array<{ id?: string }>
+    }
+
+    if (!Array.isArray(payload.data)) {
+      return []
+    }
+
+    return [...new Set(
+      payload.data
+        .map((model) => model.id)
+        .filter((id): id is string => typeof id === "string" && id.length > 0),
+    )]
+  } catch {
+    return []
+  }
+}
+
+async function promptModelSlots(
+  availableModels: Array<string>,
+  existing?: Partial<ModelSlots>,
+): Promise<ModelSlots> {
+  if (availableModels.length === 0) {
+    consola.warn(
+      "Could not fetch model list from provider. Falling back to manual model entry.",
+    )
+
+    const manualDefault = await promptText(
+      "Enter default model",
+      existing?.defaultModel || FALLBACK_MODEL,
+    )
+    const manualBig = await promptText(
+      "Enter big model (Opus slot)",
+      existing?.bigModel || manualDefault,
+    )
+    const manualSonnet = await promptText(
+      "Enter sonnet model (fast and cheap)",
+      existing?.sonnetModel || manualDefault,
+    )
+    const manualHaiku = await promptText(
+      "Enter haiku model",
+      existing?.haikuModel || manualSonnet,
+    )
+
+    return normalizeModelSlots({
+      defaultModel: manualDefault,
+      bigModel: manualBig,
+      sonnetModel: manualSonnet,
+      haikuModel: manualHaiku,
+    })
+  }
+
+  const defaultModel = await promptModelFromSearch(
+    "default model",
+    availableModels,
+    existing?.defaultModel,
+  )
+  const bigModel = await promptModelFromSearch(
+    "big model (Opus slot)",
+    availableModels,
+    existing?.bigModel || defaultModel,
+  )
+  const sonnetModel = await promptModelFromSearch(
+    "sonnet model (fast and cheap)",
+    availableModels,
+    existing?.sonnetModel || defaultModel,
+  )
+  const haikuModel = await promptModelFromSearch(
+    "haiku model",
+    availableModels,
+    existing?.haikuModel || sonnetModel,
+  )
+
+  return normalizeModelSlots({
+    defaultModel,
+    bigModel,
+    sonnetModel,
+    haikuModel,
+  })
+}
+
+async function promptModelFromSearch(
+  slotLabel: string,
+  models: Array<string>,
+  initialModel?: string,
+): Promise<string> {
+  const featured = getFeaturedModelCandidates(models, 18)
+  const manualOption = `Enter model id manually for ${slotLabel}`
+  const orderedModels = [...new Set(
+    [
+      ...(initialModel ? [initialModel] : []),
+      ...featured,
+      ...models,
+    ],
+  )]
+
+  while (true) {
+    const shortlist = [...new Set(
+      [
+        ...orderedModels,
+        manualOption,
+      ],
+    )]
+
+    const selected = await promptSelect(
+      `Search ${slotLabel}`,
+      shortlist,
+      initialModel && shortlist.includes(initialModel)
+        ? initialModel
+        : shortlist[0],
+      { spacing: "minor" },
+    )
+
+    if (selected === manualOption) {
+      return await promptText(
+        `Enter ${slotLabel}`,
+        initialModel,
+      )
+    }
+
+    return selected
+  }
+}
+
+function deriveModelSlotsFromProviderPreferences(): ModelSlots | undefined {
+  if (!state.provider.preferredModel) {
+    return undefined
+  }
+
+  return normalizeModelSlots({
+    defaultModel: state.provider.preferredModel,
+    bigModel: state.provider.preferredModel,
+    sonnetModel: state.provider.preferredModel,
+    haikuModel: state.provider.preferredSmallModel || state.provider.preferredModel,
+  })
+}
+
+function hasExplicitProviderConfiguration(options: RunServerOptions): boolean {
+  return Boolean(
+    options.provider
+      || options.providerBaseUrl
+      || options.providerApiKey
+      || options.providerModel
+      || options.providerSmallModel
+      || process.env.PROVIDER
+      || process.env.PROVIDER_BASE_URL
+      || process.env.PROVIDER_API_KEY
+      || process.env.PROVIDER_MODEL
+      || process.env.PROVIDER_SMALL_MODEL,
+  )
+}
+
+function stripBaseUrl(value: string): string {
+  return value.replace(/\/+$/, "")
+}
+
+function buildCustomProviderId(baseUrl: string): string {
+  try {
+    const parsed = new URL(baseUrl)
+    const host = parsed.hostname.replace(/[^a-zA-Z0-9]/g, "-")
+    const pathname = parsed.pathname
+      .replace(/[^a-zA-Z0-9]/g, "-")
+      .replace(/^-+|-+$/g, "")
+    const combined = pathname ? `${host}-${pathname}` : host
+    return `custom-${combined || "provider"}`.toLowerCase()
+  } catch {
+    return "custom-provider"
+  }
+}
+
+async function promptSelect(
+  message: string,
+  options: Array<string | SearchableOption>,
+  initial?: string,
+  uiOptions: { spacing?: PromptSpacing } = {},
+): Promise<string> {
+  applyPromptSpacing(uiOptions.spacing || "minor")
+
+  const normalizedOptions = options.map((option) => {
+    if (typeof option === "string") {
+      return {
+        value: option,
+        label: option,
+        short: option,
+        description: undefined,
+        normalized: option.toLowerCase(),
+      }
+    }
+
+    return {
+      value: option.value,
+      label: option.label,
+      short: option.label,
+      description: option.description,
+      normalized: `${option.label} ${option.value} ${option.searchText || ""}`
+        .toLowerCase(),
+    }
+  })
+
+  let matchCount = normalizedOptions.length
+
+  let selected: string
+  try {
+    selected = await promptSearchSelect<string>({
+      message: `${message}\nSearch:`,
+      default: initial
+        && normalizedOptions.some((option) => option.value === initial)
+        ? initial
+        : normalizedOptions[0]?.value,
+      source: async (term) => {
+        const q = String(term || "").trim().toLowerCase()
+        const filtered = q.length === 0
+          ? normalizedOptions
+          : normalizedOptions.filter((option) => option.normalized.includes(q))
+
+        matchCount = filtered.length
+
+        const visibleOptions = filtered.length > 0
+          ? filtered
+          : [
+              {
+                value: "__no_results__",
+                label: "No matches found",
+                short: "No matches found",
+                description: "Type a different search query",
+                normalized: "",
+              },
+            ]
+
+        return visibleOptions.map((option) => ({
+          value: option.value,
+          name: `  ${option.label}`,
+          short: option.short,
+          description: option.description ? `  ${option.description}` : undefined,
+          disabled: option.value === "__no_results__"
+            ? "Type to search"
+            : undefined,
+        }))
+      },
+      theme: {
+        style: {
+          searchTerm: (text: string) => {
+            const status = buildSearchStatusLabel(text, matchCount)
+            if (!status) {
+              return ""
+            }
+
+            // Keep cursor at the end of typed query while still showing match count.
+            const trailing = status.length > text.length
+              ? status.slice(text.length)
+              : ""
+            if (!trailing) {
+              return status
+            }
+
+            return `${status}\u001b[${trailing.length}D`
+          },
+          keysHelpTip: () => "↑/↓ to select • Enter: confirm • Type: to search",
+        },
+      },
+      pageSize: 14,
+    })
+  } catch (error) {
+    if (isPromptCancellationError(error)) {
+      const now = Date.now()
+      if (now - lastPromptCancelAt <= DOUBLE_ESCAPE_WINDOW_MS) {
+        lastPromptCancelAt = 0
+        throw new PromptExitError()
+      }
+      lastPromptCancelAt = now
+      throw new PromptBackError()
+    }
+
+    throw error
+  }
+
+  return String(selected)
+}
+
+function isPromptCancellationError(error: unknown): boolean {
+  if (!(error instanceof Error)) {
+    return false
+  }
+
+  return /cancel|abort|force closed|exit prompt/i.test(
+    `${error.name} ${error.message}`,
+  )
+}
+
+async function promptConfirm(message: string, initial: boolean): Promise<boolean> {
+  const selected = await consola.prompt(message, {
+    type: "confirm",
+    initial,
+  })
+
+  return Boolean(selected)
+}
+
+async function promptText(message: string, defaultValue?: string): Promise<string> {
+  while (true) {
+    const withDefault = defaultValue ? `${message} [${defaultValue}]` : message
+    const value = await consola.prompt(withDefault, {
+      type: "text",
+    })
+
+    const normalized = String(value || "").trim()
+    if (normalized.length > 0) {
+      return normalized
+    }
+
+    if (defaultValue) {
+      return defaultValue
+    }
+
+    consola.warn("Input cannot be empty.")
+  }
+}
+
+function applyPromptSpacing(spacing: PromptSpacing): void {
+  if (spacing !== "major") {
+    return
+  }
+
+  process.stdout.write("\n")
+}
+
+function summarizeModelSlotsForList(slots: ModelSlots): string {
+  return `d=${shortModel(slots.defaultModel)} | o=${shortModel(slots.bigModel)} | s=${shortModel(slots.sonnetModel)} | h=${shortModel(slots.haikuModel)}`
+}
+
+function shortModel(model: string, max: number = 24): string {
+  const summary = summarizeRoutedModel(model)
+  if (summary.length <= max) {
+    return summary
+  }
+
+  return `${summary.slice(0, Math.max(6, max - 3))}...`
+}
+
+function hasCopilotRoutedSlot(slots?: ModelSlots): boolean {
+  if (!slots) {
+    return false
+  }
+
+  return [
+    slots.defaultModel,
+    slots.bigModel,
+    slots.sonnetModel,
+    slots.haikuModel,
+  ].some((model) => decodeRoutedModel(model)?.providerId === "copilot")
+}
+
+function getSlotModel(
+  slots: ModelSlots,
+  slot: "default" | "opus" | "sonnet" | "haiku",
+): string {
+  switch (slot) {
+    case "default":
+      return slots.defaultModel
+    case "opus":
+      return slots.bigModel
+    case "sonnet":
+      return slots.sonnetModel
+    case "haiku":
+      return slots.haikuModel
+  }
+}
+
+function setSlotModel(
+  slots: ModelSlots,
+  slot: "default" | "opus" | "sonnet" | "haiku",
+  value: string,
+): ModelSlots {
+  if (slot === "default") {
+    return { ...slots, defaultModel: value }
+  }
+  if (slot === "opus") {
+    return { ...slots, bigModel: value }
+  }
+  if (slot === "sonnet") {
+    return { ...slots, sonnetModel: value }
+  }
+  return { ...slots, haikuModel: value }
+}
+
+function parseSlotLabel(
+  label: string,
+): "default" | "opus" | "sonnet" | "haiku" {
+  const normalized = label.trim().toLowerCase()
+
+  if (normalized.startsWith("default")) {
+    return "default"
+  }
+  if (normalized.startsWith("opus")) {
+    return "opus"
+  }
+  if (normalized.startsWith("sonnet")) {
+    return "sonnet"
+  }
+  return "haiku"
 }
 
 export const start = defineCommand({
@@ -184,6 +1579,27 @@ export const start = defineCommand({
       default: false,
       description: "Initialize proxy from environment variables",
     },
+    provider: {
+      type: "string",
+      description:
+        "Upstream provider preset: copilot, opencode, openrouter, groq, xai, nvidia-nim, gemini, custom",
+    },
+    "provider-base-url": {
+      type: "string",
+      description: "Override provider base URL",
+    },
+    "provider-api-key": {
+      type: "string",
+      description: "Override provider API key",
+    },
+    "provider-model": {
+      type: "string",
+      description: "Preferred default model for provider mode",
+    },
+    "provider-small-model": {
+      type: "string",
+      description: "Preferred small model for provider mode",
+    },
   },
   run({ args }) {
     const rateLimitRaw = args["rate-limit"]
@@ -202,6 +1618,11 @@ export const start = defineCommand({
       claudeCode: args["claude-code"],
       showToken: args["show-token"],
       proxyEnv: args["proxy-env"],
+      provider: args.provider,
+      providerBaseUrl: args["provider-base-url"],
+      providerApiKey: args["provider-api-key"],
+      providerModel: args["provider-model"],
+      providerSmallModel: args["provider-small-model"],
     })
   },
 })

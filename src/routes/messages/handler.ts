@@ -4,6 +4,7 @@ import consola from "consola"
 import { streamSSE } from "hono/streaming"
 
 import { awaitApproval } from "~/lib/approval"
+import { resolveProviderOverride } from "~/lib/provider-runtime"
 import { checkRateLimit } from "~/lib/rate-limit"
 import { state } from "~/lib/state"
 import {
@@ -28,17 +29,26 @@ export async function handleCompletion(c: Context) {
   const anthropicPayload = await c.req.json<AnthropicMessagesPayload>()
   consola.debug("Anthropic request payload:", JSON.stringify(anthropicPayload))
 
-  const openAIPayload = translateToOpenAI(anthropicPayload)
+  const translated = translateToOpenAI(anthropicPayload)
+  const openAIPayload = translated.payload
   consola.debug(
     "Translated OpenAI request payload:",
     JSON.stringify(openAIPayload),
+  )
+
+  const providerOverride = await resolveProviderOverride(
+    translated.providerIdOverride,
+    {
+      defaultModel: openAIPayload.model,
+      smallModel: openAIPayload.model,
+    },
   )
 
   if (state.manualApprove) {
     await awaitApproval()
   }
 
-  const response = await createChatCompletions(openAIPayload)
+  const response = await createChatCompletions(openAIPayload, providerOverride)
 
   if (isNonStreaming(response)) {
     consola.debug(
@@ -59,6 +69,7 @@ export async function handleCompletion(c: Context) {
       messageStartSent: false,
       contentBlockIndex: 0,
       contentBlockOpen: false,
+      messageTerminalSent: false,
       toolCalls: {},
     }
 

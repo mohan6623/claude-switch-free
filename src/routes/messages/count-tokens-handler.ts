@@ -7,6 +7,7 @@ import { getTokenCount } from "~/lib/tokenizer"
 
 import { type AnthropicMessagesPayload } from "./anthropic-types"
 import { translateToOpenAI } from "./non-stream-translation"
+import { applyAnthropicTokenHeuristics } from "./token-heuristics"
 
 /**
  * Handles token counting for Anthropic messages
@@ -17,10 +18,11 @@ export async function handleCountTokens(c: Context) {
 
     const anthropicPayload = await c.req.json<AnthropicMessagesPayload>()
 
-    const openAIPayload = translateToOpenAI(anthropicPayload)
+    const translated = translateToOpenAI(anthropicPayload)
+    const openAIPayload = translated.payload
 
     const selectedModel = state.models?.data.find(
-      (model) => model.id === anthropicPayload.model,
+      (model) => model.id === openAIPayload.model,
     )
 
     if (!selectedModel) {
@@ -32,29 +34,20 @@ export async function handleCountTokens(c: Context) {
 
     const tokenCount = await getTokenCount(openAIPayload, selectedModel)
 
-    if (anthropicPayload.tools && anthropicPayload.tools.length > 0) {
-      let mcpToolExist = false
-      if (anthropicBeta?.startsWith("claude-code")) {
-        mcpToolExist = anthropicPayload.tools.some((tool) =>
-          tool.name.startsWith("mcp__"),
-        )
-      }
-      if (!mcpToolExist) {
-        if (anthropicPayload.model.startsWith("claude")) {
-          // https://docs.anthropic.com/en/docs/agents-and-tools/tool-use/overview#pricing
-          tokenCount.input = tokenCount.input + 346
-        } else if (anthropicPayload.model.startsWith("grok")) {
-          tokenCount.input = tokenCount.input + 480
-        }
-      }
+    let mcpToolExist = false
+    if (anthropicBeta?.startsWith("claude-code")) {
+      mcpToolExist = Boolean(
+        anthropicPayload.tools?.some((tool) => tool.name.startsWith("mcp__")),
+      )
     }
 
-    let finalTokenCount = tokenCount.input + tokenCount.output
-    if (anthropicPayload.model.startsWith("claude")) {
-      finalTokenCount = Math.round(finalTokenCount * 1.15)
-    } else if (anthropicPayload.model.startsWith("grok")) {
-      finalTokenCount = Math.round(finalTokenCount * 1.03)
-    }
+    const finalTokenCount = applyAnthropicTokenHeuristics({
+      inputTokens: tokenCount.input,
+      outputTokens: tokenCount.output,
+      modelId: openAIPayload.model,
+      hasTools: Boolean(anthropicPayload.tools?.length),
+      mcpToolExists: mcpToolExist,
+    })
 
     consola.info("Token count:", finalTokenCount)
 

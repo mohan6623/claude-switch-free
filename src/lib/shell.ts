@@ -4,6 +4,9 @@ import process from "node:process"
 type ShellName = "bash" | "zsh" | "fish" | "powershell" | "cmd" | "sh"
 type EnvVars = Record<string, string | undefined>
 
+const quoteSingle = (value: string) => `'${value.replace(/'/g, "''")}'`
+const quoteDouble = (value: string) => `"${value.replace(/"/g, '""')}"`
+
 function getShell(): ShellName {
   const { platform, ppid, env } = process
 
@@ -53,26 +56,26 @@ export function generateEnvScript(
   switch (shell) {
     case "powershell": {
       commandBlock = filteredEnvVars
-        .map(([key, value]) => `$env:${key} = ${value}`)
+        .map(([key, value]) => `$env:${key} = ${quoteSingle(value)}`)
         .join("; ")
       break
     }
     case "cmd": {
       commandBlock = filteredEnvVars
-        .map(([key, value]) => `set ${key}=${value}`)
+        .map(([key, value]) => `set ${quoteDouble(`${key}=${value}`)}`)
         .join(" & ")
       break
     }
     case "fish": {
       commandBlock = filteredEnvVars
-        .map(([key, value]) => `set -gx ${key} ${value}`)
+        .map(([key, value]) => `set -gx ${key} ${quoteSingle(value)}`)
         .join("; ")
       break
     }
     default: {
       // bash, zsh, sh
       const assignments = filteredEnvVars
-        .map(([key, value]) => `${key}=${value}`)
+        .map(([key, value]) => `${key}=${quoteSingle(value)}`)
         .join(" ")
       commandBlock = filteredEnvVars.length > 0 ? `export ${assignments}` : ""
       break

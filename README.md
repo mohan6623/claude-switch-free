@@ -33,6 +33,7 @@ A reverse-engineered proxy for the GitHub Copilot API that exposes it as an Open
 
 - **OpenAI & Anthropic Compatibility**: Exposes GitHub Copilot as an OpenAI-compatible (`/v1/chat/completions`, `/v1/models`, `/v1/embeddings`) and Anthropic-compatible (`/v1/messages`) API.
 - **Claude Code Integration**: Easily configure and launch [Claude Code](https://docs.anthropic.com/en/docs/claude-code/overview) to use Copilot as its backend with a simple command-line flag (`--claude-code`).
+- **Interactive Startup Wizard**: On startup, choose `Copilot Pro` or `Providers`. Provider mode supports preset/custom providers, saved API keys, and saved model slots (default, opus, sonnet, haiku) with keep-or-change prompts on restart.
 - **Usage Dashboard**: A web-based dashboard to monitor your Copilot API usage, view quotas, and see detailed statistics.
 - **Rate Limit Control**: Manage API usage with rate-limiting options (`--rate-limit`) and a waiting mechanism (`--wait`) to prevent errors from rapid requests.
 - **Manual Request Approval**: Manually approve or deny each API request for fine-grained control over usage (`--manual`).
@@ -151,18 +152,46 @@ Copilot API now uses a subcommand structure with these main commands:
 
 The following command line options are available for the `start` command:
 
-| Option         | Description                                                                   | Default    | Alias |
-| -------------- | ----------------------------------------------------------------------------- | ---------- | ----- |
-| --port         | Port to listen on                                                             | 4141       | -p    |
-| --verbose      | Enable verbose logging                                                        | false      | -v    |
-| --account-type | Account type to use (individual, business, enterprise)                        | individual | -a    |
-| --manual       | Enable manual request approval                                                | false      | none  |
-| --rate-limit   | Rate limit in seconds between requests                                        | none       | -r    |
-| --wait         | Wait instead of error when rate limit is hit                                  | false      | -w    |
-| --github-token | Provide GitHub token directly (must be generated using the `auth` subcommand) | none       | -g    |
-| --claude-code  | Generate a command to launch Claude Code with Copilot API config              | false      | -c    |
-| --show-token   | Show GitHub and Copilot tokens on fetch and refresh                           | false      | none  |
-| --proxy-env    | Initialize proxy from environment variables                                   | false      | none  |
+| Option                | Description                                                                               | Default    | Alias |
+| --------------------- | ----------------------------------------------------------------------------------------- | ---------- | ----- |
+| --port                | Port to listen on                                                                         | 4141       | -p    |
+| --verbose             | Enable verbose logging                                                                    | false      | -v    |
+| --account-type        | Account type to use (individual, business, enterprise)                                    | individual | -a    |
+| --manual              | Enable manual request approval                                                            | false      | none  |
+| --rate-limit          | Rate limit in seconds between requests                                                    | none       | -r    |
+| --wait                | Wait instead of error when rate limit is hit                                              | false      | -w    |
+| --github-token        | Provide GitHub token directly (must be generated using the `auth` subcommand)             | none       | -g    |
+| --claude-code         | Generate a command to launch Claude Code with Copilot API config                          | false      | -c    |
+| --show-token          | Show GitHub and Copilot tokens on fetch and refresh                                       | false      | none  |
+| --proxy-env           | Initialize proxy from environment variables                                               | false      | none  |
+| --provider            | Provider preset override: `copilot`, `opencode`, `openrouter`, `groq`, `xai`, `nvidia-nim`, `gemini`, `custom` (omit to use interactive startup wizard) | none       | none  |
+| --provider-base-url   | Override provider base URL                                                                | none       | none  |
+| --provider-api-key    | Override provider API key                                                                 | none       | none  |
+| --provider-model      | Preferred default model in provider mode                                                  | none       | none  |
+| --provider-small-model| Preferred small model in provider mode                                                    | none       | none  |
+
+### Interactive Startup Wizard
+
+When no explicit `--provider*` overrides are passed, `start` launches an interactive flow:
+
+1. Select backend mode: `Copilot Pro` or `Providers`
+2. In provider mode, if you already have saved providers, choose one action:
+   - `Continue with current config`
+   - `Add provider`
+   - `Update provider`
+   - `Switch configured provider/model`
+3. For first-time setup or add-provider flow, select a preset provider or add a custom provider, then enter API key (preset providers display a direct API key URL)
+4. Configure model slots one by one using featured model suggestions plus search/manual entry:
+  - default model
+  - big model (Opus slot)
+  - sonnet model
+  - haiku model
+  - prompts include inline search status and hint text (`Type: to search`) similar to OpenCode/OpenRouter terminal UX
+5. On later runs, existing provider configs can be reused directly without re-entering provider/model details.
+
+Provider and model slot choices are persisted and reused on next startup.
+
+Startup output is concise by default and shows the configured slot summary (instead of printing every available provider model).
 
 ### Auth Command Options
 
@@ -217,6 +246,18 @@ Using with npx:
 # Basic usage with start command
 npx copilot-api@latest start
 
+# One-click OpenCode Zen mode (OpenAI-compatible provider)
+npx copilot-api@latest start --provider opencode --provider-api-key YOUR_OPENCODE_KEY
+
+# One-click OpenRouter mode
+npx copilot-api@latest start --provider openrouter --provider-api-key YOUR_OPENROUTER_KEY
+
+# One-click NVIDIA NIM mode
+npx copilot-api@latest start --provider nvidia-nim --provider-api-key YOUR_NVIDIA_KEY
+
+# One-click Gemini (OpenAI-compatible endpoint) mode
+npx copilot-api@latest start --provider gemini --provider-api-key YOUR_GEMINI_KEY
+
 # Run on custom port with verbose logging
 npx copilot-api@latest start --port 8080 --verbose
 
@@ -257,6 +298,45 @@ npx copilot-api@latest debug --json
 npx copilot-api@latest start --proxy-env
 ```
 
+### Provider Presets and Environment Variables
+
+The server can run in two backend modes:
+
+- `copilot` (default): Uses your GitHub Copilot Pro/Business/Enterprise subscription.
+- `openai-compatible`: Uses provider presets and routes to `/chat/completions` style APIs.
+
+You can configure provider mode entirely through environment variables (no code changes):
+
+```sh
+# Generic
+PROVIDER=opencode
+PROVIDER_API_KEY=YOUR_KEY
+PROVIDER_MODEL=qwen3.6-plus-free
+PROVIDER_SMALL_MODEL=qwen3.6-plus-free
+
+# Optional overrides
+PROVIDER_BASE_URL=https://opencode.ai/zen/v1
+```
+
+Supported presets and default base URLs:
+
+- `opencode` → `https://opencode.ai/zen/v1`
+- `openrouter` → `https://openrouter.ai/api/v1`
+- `groq` → `https://api.groq.com/openai/v1`
+- `xai` → `https://api.x.ai/v1`
+- `nvidia-nim` → `https://integrate.api.nvidia.com/v1`
+- `gemini` → `https://generativelanguage.googleapis.com/v1beta/openai`
+- `custom` → provide your own `--provider-base-url` / `PROVIDER_BASE_URL`
+
+Preset API key pages shown during startup:
+
+- `opencode`: `https://opencode.ai/settings/keys`
+- `openrouter`: `https://openrouter.ai/keys`
+- `groq`: `https://console.groq.com/keys`
+- `xai`: `https://console.x.ai/team/api-keys`
+- `nvidia-nim`: `https://build.nvidia.com/settings/api-keys`
+- `gemini`: `https://aistudio.google.com/app/apikey`
+
 ## Using the Usage Viewer
 
 After starting the server, a URL to the Copilot Usage Dashboard will be displayed in your console. This dashboard is a web interface for monitoring your API usage.
@@ -289,7 +369,11 @@ There are two ways to configure Claude Code to use this proxy:
 To get started, run the `start` command with the `--claude-code` flag:
 
 ```sh
+# Copilot Pro backend
 npx copilot-api@latest start --claude-code
+
+# Any OpenAI-compatible provider backend
+npx copilot-api@latest start --provider opencode --provider-api-key YOUR_OPENCODE_KEY --claude-code
 ```
 
 You will be prompted to select a primary model and a "small, fast" model for background tasks. After selecting the models, a command will be copied to your clipboard. This command sets the necessary environment variables for Claude Code to use the proxy.
@@ -309,6 +393,7 @@ Here is an example `.claude/settings.json` file:
     "ANTHROPIC_AUTH_TOKEN": "dummy",
     "ANTHROPIC_MODEL": "gpt-4.1",
     "ANTHROPIC_DEFAULT_SONNET_MODEL": "gpt-4.1",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL": "gpt-4.1",
     "ANTHROPIC_SMALL_FAST_MODEL": "gpt-4.1",
     "ANTHROPIC_DEFAULT_HAIKU_MODEL": "gpt-4.1",
     "DISABLE_NON_ESSENTIAL_MODEL_CALLS": "1",

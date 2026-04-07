@@ -70,7 +70,7 @@ describe("Anthropic to OpenAI translation logic", () => {
       max_tokens: 0,
     }
 
-    const openAIPayload = translateToOpenAI(anthropicPayload)
+    const openAIPayload = translateToOpenAI(anthropicPayload).payload
     expect(isValidChatCompletionRequest(openAIPayload)).toBe(true)
   })
 
@@ -99,7 +99,7 @@ describe("Anthropic to OpenAI translation logic", () => {
       ],
       tool_choice: { type: "auto" },
     }
-    const openAIPayload = translateToOpenAI(anthropicPayload)
+    const openAIPayload = translateToOpenAI(anthropicPayload).payload
     expect(isValidChatCompletionRequest(openAIPayload)).toBe(true)
   })
 
@@ -109,7 +109,7 @@ describe("Anthropic to OpenAI translation logic", () => {
       messages: [{ role: "user", content: "Hello!" }],
       max_tokens: 0,
     }
-    const openAIPayload = translateToOpenAI(anthropicPayload)
+    const openAIPayload = translateToOpenAI(anthropicPayload).payload
     expect(isValidChatCompletionRequest(openAIPayload)).toBe(true)
   })
 
@@ -120,7 +120,7 @@ describe("Anthropic to OpenAI translation logic", () => {
       temperature: "hot", // Should be a number
     }
     // @ts-expect-error intended to be invalid
-    const openAIPayload = translateToOpenAI(anthropicPayload)
+    const openAIPayload = translateToOpenAI(anthropicPayload).payload
     // Should fail validation
     expect(isValidChatCompletionRequest(openAIPayload)).toBe(false)
   })
@@ -143,7 +143,7 @@ describe("Anthropic to OpenAI translation logic", () => {
       ],
       max_tokens: 100,
     }
-    const openAIPayload = translateToOpenAI(anthropicPayload)
+    const openAIPayload = translateToOpenAI(anthropicPayload).payload
     expect(isValidChatCompletionRequest(openAIPayload)).toBe(true)
 
     // Check that thinking content is combined with text content
@@ -181,7 +181,7 @@ describe("Anthropic to OpenAI translation logic", () => {
       ],
       max_tokens: 100,
     }
-    const openAIPayload = translateToOpenAI(anthropicPayload)
+    const openAIPayload = translateToOpenAI(anthropicPayload).payload
     expect(isValidChatCompletionRequest(openAIPayload)).toBe(true)
 
     // Check that thinking content is included in the message content
@@ -196,6 +196,56 @@ describe("Anthropic to OpenAI translation logic", () => {
     )
     expect(assistantMessage?.tool_calls).toHaveLength(1)
     expect(assistantMessage?.tool_calls?.[0].function.name).toBe("get_weather")
+  })
+
+  test("extracts provider override from routed model ids", () => {
+    const anthropicPayload: AnthropicMessagesPayload = {
+      model: "cpapi-route:openrouter::qwen%2Fqwen3.6-plus%3Afree",
+      messages: [{ role: "user", content: "Hello!" }],
+      max_tokens: 16,
+    }
+
+    const translated = translateToOpenAI(anthropicPayload)
+
+    expect(translated.providerIdOverride).toBe("openrouter")
+    expect(translated.payload.model).toBe("qwen/qwen3.6-plus:free")
+  })
+
+  test("preserves image blocks for routed GPT models", () => {
+    const anthropicPayload: AnthropicMessagesPayload = {
+      model: "cpapi-route:openrouter::gpt-4o",
+      messages: [
+        {
+          role: "user",
+          content: [
+            { type: "text", text: "Describe this image." },
+            {
+              type: "image",
+              source: {
+                type: "base64",
+                media_type: "image/png",
+                data: "ZmFrZS1pbWFnZS1kYXRh",
+              },
+            },
+          ],
+        },
+      ],
+      max_tokens: 128,
+    }
+
+    const translated = translateToOpenAI(anthropicPayload)
+    const userMessage = translated.payload.messages.find(
+      (m) => m.role === "user",
+    )
+
+    expect(translated.providerIdOverride).toBe("openrouter")
+    expect(Array.isArray(userMessage?.content)).toBe(true)
+    expect(userMessage?.content).toContainEqual({
+      type: "image_url",
+      image_url: {
+        url: "data:image/png;base64,ZmFrZS1pbWFnZS1kYXRh",
+      },
+    })
   })
 })
 
