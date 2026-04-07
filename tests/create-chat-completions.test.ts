@@ -2,10 +2,25 @@ import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test"
 
 import type { ChatCompletionsPayload } from "../src/services/copilot/create-chat-completions"
 
+import { HTTPError } from "../src/lib/error"
 import { state } from "../src/lib/state"
 import { createChatCompletions } from "../src/services/copilot/create-chat-completions"
 
 const originalFetch = globalThis.fetch
+
+function resetStateForTests() {
+  state.copilotToken = "test-token"
+  state.vsCodeVersion = "1.0.0"
+  state.accountType = "individual"
+  state.provider = {
+    id: "copilot",
+    mode: "copilot",
+  }
+}
+
+function restoreFetchForTests() {
+  ;(globalThis as unknown as { fetch: typeof fetch }).fetch = originalFetch
+}
 
 function installFetchMock(
   implementation: (url: string, init: RequestInit) => Response,
@@ -40,20 +55,10 @@ function buildSuccessResponse(model: string): Response {
   })
 }
 
-describe("createChatCompletions", () => {
-  beforeEach(() => {
-    state.copilotToken = "test-token"
-    state.vsCodeVersion = "1.0.0"
-    state.accountType = "individual"
-    state.provider = {
-      id: "copilot",
-      mode: "copilot",
-    }
-  })
+describe("createChatCompletions core behavior", () => {
+  beforeEach(resetStateForTests)
 
-  afterEach(() => {
-    ;(globalThis as unknown as { fetch: typeof fetch }).fetch = originalFetch
-  })
+  afterEach(restoreFetchForTests)
 
   test("sets X-Initiator to agent if tool/assistant present", async () => {
     const fetchMock = installFetchMock((_url, init) => {
@@ -180,5 +185,138 @@ describe("createChatCompletions", () => {
     expect(first.some((part) => part.type === "image_url")).toBe(true)
     expect(second.some((part) => part.type === "image_url")).toBe(false)
     expect(second.some((part) => part.type === "text")).toBe(true)
+  })
+
+  test("retries provider request after dropping unsupported top-level field", async () => {
+    state.provider = {
+      id: "opencode",
+      mode: "openai-compatible",
+      baseUrl: "https://opencode.ai/zen/v1",
+      apiKey: "sk-provider",
+    }
+
+    const capturedBodies: Array<Record<string, unknown>> = []
+    let attempt = 0
+    const fetchMock = installFetchMock((url, init) => {
+      expect(url).toBe("https://opencode.ai/zen/v1/chat/completions")
+
+      const body = init.body as string
+      capturedBodies.push(JSON.parse(body) as Record<string, unknown>)
+
+      if (attempt === 0) {
+        attempt = attempt + 1
+        return Response.json(
+          {
+            error: {
+              message: "Unsupported parameter: response_format",
+              type: "error",
+            },
+          },
+          { status: 400 },
+        )
+      }
+
+      return buildSuccessResponse("kimi_k2")
+    })
+
+    const payload: ChatCompletionsPayload = {
+      model: "kimi_k2",
+      response_format: { type: "json_object" },
+      messages: [{ role: "user", content: "hello" }],
+    }
+
+    await createChatCompletions(payload)
+
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    expect(capturedBodies[0]).toBeDefined()
+    expect(capturedBodies[1]).toBeDefined()
+
+    expect(capturedBodies[0]?.response_format).toEqual({
+      type: "json_object",
+    })
+    expect(capturedBodies[1]?.response_format).toBeUndefined()
+  })
+})
+
+describe("createChatCompletions rate limit handling", () => {
+  beforeEach(resetStateForTests)
+
+  afterEach(restoreFetchForTests)
+
+  test("retries on upstream 429 using provider cooldown and succeeds", async () => {
+    state.provider = {
+      id: "nvidia-nim",
+      mode: "openai-compatible",
+      baseUrl: "https://integrate.api.nvidia.com/v1",
+      apiKey: "sk-provider",
+    }
+
+    let attempt = 0
+    const fetchMock = installFetchMock((url) => {
+      expect(url).toBe("https://integrate.api.nvidia.com/v1/chat/completions")
+
+      if (attempt === 0) {
+        attempt = attempt + 1
+        return new Response(
+          JSON.stringify({ status: 429, title: "Too Many Requests" }),
+          {
+            status: 429,
+            headers: {
+              "content-type": "application/problem+json",
+              "retry-after": "0",
+            },
+          },
+        )
+      }
+
+      return buildSuccessResponse("minimaxai/minimax-m2.5")
+    })
+
+    const payload: ChatCompletionsPayload = {
+      model: "minimaxai/minimax-m2.5",
+      messages: [{ role: "user", content: "hello" }],
+    }
+
+    await createChatCompletions(payload)
+
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+  })
+
+  test("stops retrying when upstream 429 persists", async () => {
+    state.provider = {
+      id: "nvidia-nim",
+      mode: "openai-compatible",
+      baseUrl: "https://integrate.api.nvidia.com/v1",
+      apiKey: "sk-provider",
+    }
+
+    const fetchMock = installFetchMock((url) => {
+      expect(url).toBe("https://integrate.api.nvidia.com/v1/chat/completions")
+      return new Response(
+        JSON.stringify({ status: 429, title: "Too Many Requests" }),
+        {
+          status: 429,
+          headers: {
+            "content-type": "application/problem+json",
+            "retry-after": "0",
+          },
+        },
+      )
+    })
+
+    const payload: ChatCompletionsPayload = {
+      model: "minimaxai/minimax-m2.5",
+      messages: [{ role: "user", content: "hello" }],
+    }
+
+    let thrown: unknown
+    try {
+      await createChatCompletions(payload)
+    } catch (error) {
+      thrown = error
+    }
+
+    expect(thrown).toBeInstanceOf(HTTPError)
+    expect(fetchMock).toHaveBeenCalledTimes(3)
   })
 })

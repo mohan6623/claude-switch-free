@@ -24,6 +24,12 @@ export async function forwardError(c: Context, error: unknown) {
       errorJson = errorText
     }
     consola.error("HTTP error:", errorJson)
+
+    const responseHeaders =
+      error.response.status === 429 ?
+        pickRateLimitHeaders(error.response)
+      : undefined
+
     return c.json(
       {
         error: {
@@ -32,6 +38,7 @@ export async function forwardError(c: Context, error: unknown) {
         },
       },
       error.response.status as ContentfulStatusCode,
+      responseHeaders,
     )
   }
 
@@ -44,4 +51,28 @@ export async function forwardError(c: Context, error: unknown) {
     },
     500,
   )
+}
+
+function pickRateLimitHeaders(response: Response): Record<string, string> {
+  const headerNames = [
+    "retry-after",
+    "ratelimit-reset",
+    "x-ratelimit-reset",
+    "x-ratelimit-reset-requests",
+    "x-ratelimit-reset-tokens",
+    "x-ratelimit-remaining-requests",
+    "x-ratelimit-remaining-tokens",
+    "x-ratelimit-limit-requests",
+    "x-ratelimit-limit-tokens",
+  ]
+
+  const selected: Record<string, string> = {}
+  for (const headerName of headerNames) {
+    const value = response.headers.get(headerName)
+    if (value) {
+      selected[headerName] = value
+    }
+  }
+
+  return selected
 }
