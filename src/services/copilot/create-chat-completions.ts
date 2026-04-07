@@ -1,9 +1,10 @@
 import consola from "consola"
 import { events } from "fetch-event-stream"
 
+import type { ProviderConfig } from "~/lib/provider-config"
+
 import { copilotHeaders, copilotBaseUrl } from "~/lib/api-config"
 import { HTTPError } from "~/lib/error"
-import type { ProviderConfig } from "~/lib/provider-config"
 import { state } from "~/lib/state"
 
 export const createChatCompletions = async (
@@ -13,7 +14,10 @@ export const createChatCompletions = async (
   const effectiveProvider = providerOverride || state.provider
 
   if (effectiveProvider.mode === "openai-compatible") {
-    return await createOpenAICompatibleChatCompletions(payload, effectiveProvider)
+    return await createOpenAICompatibleChatCompletions(
+      payload,
+      effectiveProvider,
+    )
   }
 
   if (!state.copilotToken) throw new Error("Copilot token not found")
@@ -64,18 +68,34 @@ async function createOpenAICompatibleChatCompletions(
     )
   }
 
-  const response = await fetch(`${provider.baseUrl}/chat/completions`, {
-    method: "POST",
-    headers: {
-      accept: "application/json",
-      "content-type": "application/json",
-      authorization: `Bearer ${provider.apiKey}`,
-      ...(provider.headers || {}),
-    },
-    body: JSON.stringify(payload),
-  })
+  const response = await postOpenAICompatibleChatCompletions(payload, provider)
 
   if (!response.ok) {
+    if (payloadHasImages(payload)) {
+      const errorText = await response.clone().text()
+      if (isNonMultimodalModelError(errorText)) {
+        const fallbackPayload = stripImagesFromPayload(payload)
+        consola.warn(
+          "Upstream model rejected multimodal request; retrying without image blocks.",
+        )
+
+        const retry = await postOpenAICompatibleChatCompletions(
+          fallbackPayload,
+          provider,
+        )
+        if (!retry.ok) {
+          consola.error("Failed to create chat completions", retry)
+          throw new HTTPError("Failed to create chat completions", retry)
+        }
+
+        if (fallbackPayload.stream) {
+          return events(retry)
+        }
+
+        return (await retry.json()) as ChatCompletionResponse
+      }
+    }
+
     consola.error("Failed to create chat completions", response)
     throw new HTTPError("Failed to create chat completions", response)
   }
@@ -85,6 +105,76 @@ async function createOpenAICompatibleChatCompletions(
   }
 
   return (await response.json()) as ChatCompletionResponse
+}
+
+async function postOpenAICompatibleChatCompletions(
+  payload: ChatCompletionsPayload,
+  provider: ProviderConfig,
+): Promise<Response> {
+  return await fetch(`${provider.baseUrl}/chat/completions`, {
+    method: "POST",
+    headers: {
+      accept: "application/json",
+      "content-type": "application/json",
+      authorization: `Bearer ${provider.apiKey}`,
+      ...provider.headers,
+    },
+    body: JSON.stringify(payload),
+  })
+}
+
+function payloadHasImages(payload: ChatCompletionsPayload): boolean {
+  return payload.messages.some(
+    (message) =>
+      Array.isArray(message.content)
+      && message.content.some((part) => part.type === "image_url"),
+  )
+}
+
+function stripImagesFromPayload(
+  payload: ChatCompletionsPayload,
+): ChatCompletionsPayload {
+  return {
+    ...payload,
+    messages: payload.messages.map((message) => {
+      if (!Array.isArray(message.content)) {
+        return message
+      }
+
+      const withoutImages = message.content.filter(
+        (part) => part.type !== "image_url",
+      )
+      if (withoutImages.length === message.content.length) {
+        return message
+      }
+
+      if (withoutImages.length > 0) {
+        return {
+          ...message,
+          content: withoutImages,
+        }
+      }
+
+      return {
+        ...message,
+        content: [
+          {
+            type: "text",
+            text: "[Image omitted because selected model is not multimodal.]",
+          },
+        ],
+      }
+    }),
+  }
+}
+
+function isNonMultimodalModelError(errorText: string): boolean {
+  const normalized = errorText.toLowerCase()
+  return (
+    normalized.includes("not a multimodal model")
+    || normalized.includes("not multimodal")
+    || normalized.includes("does not support image")
+  )
 }
 
 // Streaming types
