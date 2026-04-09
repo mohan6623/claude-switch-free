@@ -1,12 +1,14 @@
 import { afterEach, describe, expect, test } from "bun:test"
 import fs from "node:fs/promises"
-import path from "node:path"
 import os from "node:os"
+import path from "node:path"
 
 import { PATHS } from "../src/lib/paths"
 import {
+  clearProviderModelSlots,
   getActiveProviderProfile,
   loadStartupConfig,
+  removeProviderProfile,
   saveStartupConfig,
   setActiveProvider,
   upsertProviderProfile,
@@ -15,7 +17,7 @@ import {
 
 const originalPath = PATHS.STARTUP_CONFIG_PATH
 
-afterEach(async () => {
+afterEach(() => {
   PATHS.STARTUP_CONFIG_PATH = originalPath
 })
 
@@ -45,6 +47,7 @@ describe("startup config persistence", () => {
       apiKey: "sk-test",
       apiKeyUrl: "https://opencode.ai/settings/keys",
       isPreset: true,
+      requestHandlingMode: "resilient",
       modelSlots: {
         defaultModel: "qwen3.6-plus-free",
         bigModel: "gpt-5.4",
@@ -60,9 +63,39 @@ describe("startup config persistence", () => {
     expect(reloaded.providers).toHaveLength(1)
     expect(reloaded.providers[0]?.id).toBe("opencode")
     expect(reloaded.providers[0]?.modelSlots?.bigModel).toBe("gpt-5.4")
+    expect(reloaded.providers[0]?.requestHandlingMode).toBe("resilient")
   })
 
-  test("upsert replaces existing provider with same id", async () => {
+  test("defaults request handling mode to balanced for legacy provider configs", async () => {
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "copilot-api-startup-config-"))
+    PATHS.STARTUP_CONFIG_PATH = path.join(tempDir, "startup-config.json")
+
+    const legacyConfig = {
+      version: 1,
+      activeProviderId: "opencode",
+      providers: [
+        {
+          id: "opencode",
+          label: "OpenCode",
+          baseUrl: "https://opencode.ai/zen/v1",
+          apiKey: "sk-test",
+          isPreset: true,
+          updatedAt: "2026-04-07T00:00:00.000Z",
+        },
+      ],
+    }
+
+    await fs.writeFile(
+      PATHS.STARTUP_CONFIG_PATH,
+      JSON.stringify(legacyConfig, null, 2),
+      "utf8",
+    )
+
+    const reloaded = await loadStartupConfig()
+    expect(reloaded.providers[0]?.requestHandlingMode).toBe("balanced")
+  })
+
+  test("upsert replaces existing provider with same id", () => {
     const empty: StartupConfig = { version: 1, providers: [] }
 
     const first = upsertProviderProfile(empty, {
@@ -94,7 +127,7 @@ describe("startup config persistence", () => {
     expect(second.providers[0]?.modelSlots?.defaultModel).toBe("model-a")
   })
 
-  test("sets active provider and resolves active profile", async () => {
+  test("sets active provider and resolves active profile", () => {
     const empty: StartupConfig = { version: 1, providers: [] }
 
     const withA = upsertProviderProfile(empty, {
@@ -119,5 +152,66 @@ describe("startup config persistence", () => {
 
     expect(activeSet.activeProviderId).toBe("openrouter")
     expect(getActiveProviderProfile(activeSet)?.id).toBe("openrouter")
+  })
+
+  test("removes provider and reassigns active provider", () => {
+    const base: StartupConfig = {
+      version: 1,
+      activeProviderId: "openrouter",
+      providers: [
+        {
+          id: "openrouter",
+          label: "OpenRouter",
+          baseUrl: "https://openrouter.ai/api/v1",
+          apiKey: "sk-or",
+          isPreset: true,
+          updatedAt: "2026-04-09T00:00:00.000Z",
+        },
+        {
+          id: "gemini",
+          label: "Google Gemini (OpenAI-compatible)",
+          baseUrl: "https://generativelanguage.googleapis.com/v1beta/openai",
+          apiKey: "sk-gm",
+          isPreset: true,
+          updatedAt: "2026-04-09T00:00:01.000Z",
+        },
+      ],
+    }
+
+    const removed = removeProviderProfile(base, "openrouter")
+
+    expect(removed.providers).toHaveLength(1)
+    expect(removed.providers[0]?.id).toBe("gemini")
+    expect(removed.activeProviderId).toBe("gemini")
+  })
+
+  test("clears model slots for selected provider", () => {
+    const base: StartupConfig = {
+      version: 1,
+      activeProviderId: "gemini",
+      providers: [
+        {
+          id: "gemini",
+          label: "Google Gemini (OpenAI-compatible)",
+          baseUrl: "https://generativelanguage.googleapis.com/v1beta/openai",
+          apiKey: "sk-gm",
+          isPreset: true,
+          modelSlots: {
+            defaultModel: "gemini-2.0-flash",
+            bigModel: "gemini-2.5-pro",
+            sonnetModel: "gemini-2.0-flash",
+            haikuModel: "gemini-2.0-flash",
+          },
+          updatedAt: "2026-04-09T00:00:00.000Z",
+        },
+      ],
+    }
+
+    const cleared = clearProviderModelSlots(base, "gemini")
+
+    expect(cleared.providers).toHaveLength(1)
+    expect(cleared.providers[0]?.id).toBe("gemini")
+    expect(cleared.providers[0]?.modelSlots).toBeUndefined()
+    expect(cleared.activeProviderId).toBe("gemini")
   })
 })

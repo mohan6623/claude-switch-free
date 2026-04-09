@@ -1,4 +1,28 @@
-export type ProviderMode = "copilot" | "openai-compatible"
+export type ProviderMode = "copilot" | "openai-compatible" | "vertex-ai"
+
+export type ProviderRequestHandlingMode =
+  | "strict"
+  | "balanced"
+  | "resilient"
+
+export const DEFAULT_PROVIDER_REQUEST_HANDLING_MODE: ProviderRequestHandlingMode =
+  "balanced"
+
+export function normalizeProviderRequestHandlingMode(
+  value?: string,
+): ProviderRequestHandlingMode {
+  const normalized = value?.trim().toLowerCase()
+
+  if (normalized === "strict") {
+    return "strict"
+  }
+
+  if (normalized === "resilient") {
+    return "resilient"
+  }
+
+  return DEFAULT_PROVIDER_REQUEST_HANDLING_MODE
+}
 
 export interface ProviderConfig {
   id: string
@@ -8,6 +32,7 @@ export interface ProviderConfig {
   headers?: Record<string, string>
   preferredModel?: string
   preferredSmallModel?: string
+  requestHandlingMode?: ProviderRequestHandlingMode
 }
 
 export interface ResolveProviderOptions {
@@ -16,6 +41,7 @@ export interface ResolveProviderOptions {
   providerApiKey?: string
   providerModel?: string
   providerSmallModel?: string
+  providerRequestHandlingMode?: string
 }
 
 export interface SavedProviderProfileLike {
@@ -23,6 +49,7 @@ export interface SavedProviderProfileLike {
   baseUrl: string
   apiKey: string
   isPreset: boolean
+  requestHandlingMode?: ProviderRequestHandlingMode
 }
 
 const trim = (value?: string) => {
@@ -39,6 +66,7 @@ function openAICompatibleConfig(input: {
   model?: string
   smallModel?: string
   headers?: Record<string, string>
+  requestHandlingMode?: string
 }): ProviderConfig {
   if (!input.baseUrl) {
     throw new Error(`Missing base URL for provider \"${input.id}\"`)
@@ -56,6 +84,9 @@ function openAICompatibleConfig(input: {
     headers: input.headers,
     preferredModel: input.model,
     preferredSmallModel: input.smallModel,
+    requestHandlingMode: normalizeProviderRequestHandlingMode(
+      input.requestHandlingMode,
+    ),
   }
 }
 
@@ -76,6 +107,9 @@ export function resolveProviderConfig(
     trim(options.providerModel) || trim(process.env.PROVIDER_MODEL)
   const providerSmallModel =
     trim(options.providerSmallModel) || trim(process.env.PROVIDER_SMALL_MODEL)
+  const providerRequestHandlingMode =
+    trim(options.providerRequestHandlingMode)
+    || trim(process.env.PROVIDER_REQUEST_HANDLING_MODE)
 
   if (requestedProvider === "copilot") {
     return {
@@ -86,6 +120,20 @@ export function resolveProviderConfig(
     }
   }
 
+  if (requestedProvider === "vertex-ai") {
+    return {
+      id: "vertex-ai",
+      mode: "vertex-ai",
+      baseUrl: customBaseUrl, // Use baseUrl to store the GCP region (e.g., us-central1)
+      apiKey: customApiKey,   // Use apiKey to store the explicit GCP project ID, if any
+      preferredModel: providerModel,
+      preferredSmallModel: providerSmallModel,
+      requestHandlingMode: normalizeProviderRequestHandlingMode(
+        providerRequestHandlingMode,
+      ),
+    }
+  }
+
   if (requestedProvider === "custom") {
     return openAICompatibleConfig({
       id: "custom",
@@ -93,6 +141,7 @@ export function resolveProviderConfig(
       apiKey: customApiKey,
       model: providerModel,
       smallModel: providerSmallModel,
+      requestHandlingMode: providerRequestHandlingMode,
     })
   }
 
@@ -103,6 +152,7 @@ export function resolveProviderConfig(
       apiKey: customApiKey || trim(process.env.OPENCODE_API_KEY),
       model: providerModel || "qwen3.6-plus-free",
       smallModel: providerSmallModel || "qwen3.6-plus-free",
+      requestHandlingMode: providerRequestHandlingMode,
     })
   }
 
@@ -113,6 +163,7 @@ export function resolveProviderConfig(
       apiKey: customApiKey || trim(process.env.OPENROUTER_API_KEY),
       model: providerModel,
       smallModel: providerSmallModel,
+      requestHandlingMode: providerRequestHandlingMode,
       headers: {
         ...(trim(process.env.OPENROUTER_HTTP_REFERER) && {
           "HTTP-Referer": trim(process.env.OPENROUTER_HTTP_REFERER)!,
@@ -131,6 +182,7 @@ export function resolveProviderConfig(
       apiKey: customApiKey || trim(process.env.GROQ_API_KEY),
       model: providerModel,
       smallModel: providerSmallModel,
+      requestHandlingMode: providerRequestHandlingMode,
     })
   }
 
@@ -141,6 +193,7 @@ export function resolveProviderConfig(
       apiKey: customApiKey || trim(process.env.XAI_API_KEY),
       model: providerModel,
       smallModel: providerSmallModel,
+      requestHandlingMode: providerRequestHandlingMode,
     })
   }
 
@@ -151,6 +204,7 @@ export function resolveProviderConfig(
       apiKey: customApiKey || trim(process.env.NVIDIA_API_KEY),
       model: providerModel,
       smallModel: providerSmallModel,
+      requestHandlingMode: providerRequestHandlingMode,
     })
   }
 
@@ -162,6 +216,7 @@ export function resolveProviderConfig(
       apiKey: customApiKey || trim(process.env.GEMINI_API_KEY),
       model: providerModel,
       smallModel: providerSmallModel,
+      requestHandlingMode: providerRequestHandlingMode,
     })
   }
 
@@ -194,5 +249,6 @@ export function resolveProviderConfigFromProfile(
     providerApiKey: profile.apiKey,
     providerModel: models?.defaultModel,
     providerSmallModel: models?.smallModel,
+    providerRequestHandlingMode: profile.requestHandlingMode,
   })
 }

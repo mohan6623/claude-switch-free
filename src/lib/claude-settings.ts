@@ -1,9 +1,19 @@
 import fs from "node:fs/promises"
+import os from "node:os"
 import path from "node:path"
+
+import { normalizeModelSlots, type ModelSlots } from "./startup-wizard"
+
+export type ClaudeSettingsSyncTarget = "local" | "global"
 
 export interface ClaudeSettingsJson {
   env: Record<string, string>
   [key: string]: unknown
+}
+
+export interface LoadedClaudeModelSlots {
+  path: string
+  slots: ModelSlots
 }
 
 export function mergeClaudeSettingsJson(
@@ -38,24 +48,41 @@ export function mergeClaudeSettingsJson(
 export async function resolveClaudeSettingsLocalPath(
   startDir: string,
 ): Promise<string | undefined> {
-  let current = path.resolve(startDir)
+  const candidates = resolveClaudeSettingsLocalCandidatePaths(startDir)
 
-  while (true) {
-    const candidate = path.join(current, ".claude", "settings.local.json")
-    try {
-      await fs.access(candidate, fs.constants.R_OK | fs.constants.W_OK)
+  for (const candidate of candidates) {
+    if (await isReadableWritable(candidate)) {
       return candidate
-    } catch {
-      // keep walking up
     }
-
-    const parent = path.dirname(current)
-    if (parent === current) {
-      return undefined
-    }
-
-    current = parent
   }
+
+  return undefined
+}
+
+export function resolveClaudeSettingsGlobalPath(homeDir?: string): string {
+  return path.join(homeDir || os.homedir(), ".claude", "settings.json")
+}
+
+export async function loadClaudeModelSlotsForTarget(
+  syncTarget: ClaudeSettingsSyncTarget,
+  startDir: string,
+  options: { homeDir?: string } = {},
+): Promise<LoadedClaudeModelSlots | undefined> {
+  const candidates = syncTarget === "global"
+    ? resolveClaudeSettingsGlobalCandidatePaths(options.homeDir)
+    : resolveClaudeSettingsLocalCandidatePaths(startDir)
+
+  for (const candidate of candidates) {
+    const slots = await readClaudeModelSlotsFromPath(candidate)
+    if (slots) {
+      return {
+        path: candidate,
+        slots,
+      }
+    }
+  }
+
+  return undefined
 }
 
 export async function syncClaudeSettingsLocal(
@@ -67,6 +94,22 @@ export async function syncClaudeSettingsLocal(
     return { updated: false }
   }
 
+  return await syncClaudeSettingsPath(settingsPath, envPatch)
+}
+
+export async function syncClaudeSettingsGlobal(
+  envPatch: Record<string, string>,
+  options: { homeDir?: string } = {},
+): Promise<{ updated: boolean; path?: string }> {
+  const settingsPath = resolveClaudeSettingsGlobalPath(options.homeDir)
+  await fs.mkdir(path.dirname(settingsPath), { recursive: true })
+  return await syncClaudeSettingsPath(settingsPath, envPatch)
+}
+
+async function syncClaudeSettingsPath(
+  settingsPath: string,
+  envPatch: Record<string, string>,
+): Promise<{ updated: boolean; path?: string }> {
   let parsed: unknown = {}
   try {
     const raw = await fs.readFile(settingsPath, "utf8")
@@ -82,4 +125,101 @@ export async function syncClaudeSettingsLocal(
     updated: true,
     path: settingsPath,
   }
+}
+
+function resolveClaudeSettingsLocalCandidatePaths(startDir: string): Array<string> {
+  const candidates: Array<string> = []
+  let current = path.resolve(startDir)
+
+  while (true) {
+    candidates.push(path.join(current, ".claude", "settings.local.json"))
+    candidates.push(path.join(current, ".claude", "settings.json"))
+
+    const parent = path.dirname(current)
+    if (parent === current) {
+      break
+    }
+
+    current = parent
+  }
+
+  return candidates
+}
+
+function resolveClaudeSettingsGlobalCandidatePaths(homeDir?: string): Array<string> {
+  const home = homeDir || os.homedir()
+  return [
+    path.join(home, ".claude", "settings.json"),
+    path.join(home, ".claude", "settings.local.json"),
+  ]
+}
+
+async function isReadableWritable(filePath: string): Promise<boolean> {
+  try {
+    await fs.access(filePath, fs.constants.R_OK | fs.constants.W_OK)
+    return true
+  } catch {
+    return false
+  }
+}
+
+async function readClaudeModelSlotsFromPath(
+  filePath: string,
+): Promise<ModelSlots | undefined> {
+  try {
+    const raw = await fs.readFile(filePath, "utf8")
+    if (!raw.trim()) {
+      return undefined
+    }
+
+    const parsed = JSON.parse(raw) as unknown
+    return extractModelSlotsFromClaudeSettingsJson(parsed)
+  } catch {
+    return undefined
+  }
+}
+
+function extractModelSlotsFromClaudeSettingsJson(
+  input: unknown,
+): ModelSlots | undefined {
+  if (!input || typeof input !== "object") {
+    return undefined
+  }
+
+  const source = input as { env?: unknown }
+  if (!source.env || typeof source.env !== "object") {
+    return undefined
+  }
+
+  const env = source.env as Record<string, unknown>
+
+  const defaultModel =
+    readEnvString(env.ANTHROPIC_MODEL)
+    || readEnvString(env.ANTHROPIC_DEFAULT_SONNET_MODEL)
+
+  if (!defaultModel) {
+    return undefined
+  }
+
+  try {
+    return normalizeModelSlots({
+      defaultModel,
+      bigModel: readEnvString(env.ANTHROPIC_DEFAULT_OPUS_MODEL),
+      sonnetModel: readEnvString(env.ANTHROPIC_DEFAULT_SONNET_MODEL),
+      haikuModel:
+        readEnvString(env.ANTHROPIC_DEFAULT_HAIKU_MODEL)
+        || readEnvString(env.ANTHROPIC_SMALL_FAST_MODEL),
+    })
+  } catch {
+    return undefined
+  }
+}
+
+function readEnvString(value: unknown): string | undefined {
+  if (typeof value !== "string") {
+    return undefined
+  }
+
+  const trimmed = value.trim()
+  return trimmed.length > 0 ? trimmed : undefined
 }

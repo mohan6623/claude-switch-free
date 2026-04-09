@@ -8,18 +8,27 @@ import { serve, type ServerHandler } from "srvx"
 import invariant from "tiny-invariant"
 
 import { ensurePaths } from "./lib/paths"
-import { syncClaudeSettingsLocal } from "./lib/claude-settings"
 import {
+  loadClaudeModelSlotsForTarget,
+  syncClaudeSettingsGlobal,
+  syncClaudeSettingsLocal,
+  type ClaudeSettingsSyncTarget,
+} from "./lib/claude-settings"
+import {
+  normalizeProviderRequestHandlingMode,
   resolveProviderConfig,
+  type ProviderRequestHandlingMode,
   type ResolveProviderOptions,
 } from "./lib/provider-config"
 import { initProxyFromEnv } from "./lib/proxy"
 import { generateEnvScript } from "./lib/shell"
 import { state } from "./lib/state"
 import {
+  clearProviderModelSlots,
   getActiveProviderProfile,
   getProviderProfile,
   loadStartupConfig,
+  removeProviderProfile,
   saveStartupConfig,
   setActiveProvider,
   upsertProviderProfile,
@@ -67,6 +76,7 @@ interface RunServerOptions {
   providerApiKey?: string
   providerModel?: string
   providerSmallModel?: string
+  providerRequestHandlingMode?: string
 }
 
 interface StartupSelection {
@@ -90,6 +100,12 @@ interface SearchableOption {
   searchText?: string
 }
 
+interface SwitchSessionSlotSource {
+  providerId: string
+  path: string
+  slots: ModelSlots
+}
+
 type PromptSpacing = "major" | "minor" | "none"
 
 const ADD_CUSTOM_PROVIDER_LABEL = "Add custom provider"
@@ -97,8 +113,11 @@ const PROVIDER_ACTION_CONTINUE = "Continue with current config"
 const PROVIDER_ACTION_ADD = "Add provider"
 const PROVIDER_ACTION_UPDATE = "Update provider"
 const PROVIDER_ACTION_SWITCH = "Switch configured provider/model"
+const PROVIDER_ACTION_DELETE = "Delete provider"
+const PROVIDER_ACTION_DELETE_MODELS = "Delete model mappings"
 const FALLBACK_MODEL = "qwen/qwen3.6-plus:free"
 const DOUBLE_ESCAPE_WINDOW_MS = 850
+const DEFAULT_CLAUDE_SETTINGS_SYNC_TARGET: ClaudeSettingsSyncTarget = "local"
 
 class PromptBackError extends Error {
   constructor() {
@@ -118,20 +137,75 @@ let lastPromptCancelAt = 0
 
 async function syncClaudeSettingsFromStartupConfig(
   config: Awaited<ReturnType<typeof loadStartupConfig>>,
+  syncTarget: ClaudeSettingsSyncTarget,
 ): Promise<void> {
   const active = getActiveProviderProfile(config)
   if (!active || !hasCompleteModelSlots(active.modelSlots)) {
     return
   }
 
-  const result = await syncClaudeSettingsLocal(
-    process.cwd(),
-    buildClaudeModelSlotEnv(normalizeModelSlots(active.modelSlots)),
-  )
+  const envPatch = buildClaudeModelSlotEnv(normalizeModelSlots(active.modelSlots))
+
+  const result = syncTarget === "global"
+    ? await syncClaudeSettingsGlobal(envPatch)
+    : await syncClaudeSettingsLocal(process.cwd(), envPatch)
 
   if (result.updated && result.path) {
     consola.info(`Synced Claude settings: ${result.path}`)
+    return
   }
+
+  if (syncTarget === "local") {
+    consola.warn("No .claude/settings.local.json found to sync from current workspace path.")
+  }
+}
+
+async function persistSwitchConfigWithTarget(
+  config: Awaited<ReturnType<typeof loadStartupConfig>>,
+  syncTarget: ClaudeSettingsSyncTarget,
+): Promise<void> {
+  await persistSwitchConfig({
+    config,
+    sync: (nextConfig) =>
+      syncClaudeSettingsFromStartupConfig(nextConfig, syncTarget),
+    save: saveStartupConfig,
+  })
+}
+
+async function resolveSwitchSessionSlotSource(
+  config: Awaited<ReturnType<typeof loadStartupConfig>>,
+  syncTarget: ClaudeSettingsSyncTarget,
+): Promise<SwitchSessionSlotSource | undefined> {
+  const active = getActiveProviderProfile(config)
+  if (!active) {
+    return undefined
+  }
+
+  const loaded = await loadClaudeModelSlotsForTarget(syncTarget, process.cwd())
+  if (!loaded) {
+    return undefined
+  }
+
+  return {
+    providerId: active.id,
+    path: loaded.path,
+    slots: loaded.slots,
+  }
+}
+
+function resolveDisplayModelSlotsForProfile(
+  profile: ProviderProfile,
+  slotSource?: SwitchSessionSlotSource,
+): ModelSlots | undefined {
+  if (slotSource?.providerId === profile.id) {
+    return slotSource.slots
+  }
+
+  if (!hasCompleteModelSlots(profile.modelSlots)) {
+    return undefined
+  }
+
+  return normalizeModelSlots(profile.modelSlots)
 }
 
 export async function runServer(options: RunServerOptions): Promise<void> {
@@ -149,6 +223,8 @@ export async function runServer(options: RunServerOptions): Promise<void> {
     providerApiKey: startupSelection.providerOptions.providerApiKey,
     providerModel: startupSelection.providerOptions.providerModel,
     providerSmallModel: startupSelection.providerOptions.providerSmallModel,
+    providerRequestHandlingMode:
+      startupSelection.providerOptions.providerRequestHandlingMode,
   })
 
   const copilotRouted = hasCopilotRoutedSlot(startupSelection.modelSlots)
@@ -263,7 +339,7 @@ export async function runServer(options: RunServerOptions): Promise<void> {
   }
 
   consola.box(
-    `🌐 Usage Viewer: https://ericc-ch.github.io/copilot-api?endpoint=${serverUrl}/usage`,
+    `Usage Viewer: https://ericc-ch.github.io/copilot-api?endpoint=${serverUrl}/usage`,
   )
 
   serve({
@@ -283,6 +359,7 @@ async function resolveStartupSelection(
         providerApiKey: options.providerApiKey,
         providerModel: options.providerModel,
         providerSmallModel: options.providerSmallModel,
+        providerRequestHandlingMode: options.providerRequestHandlingMode,
       },
     }
   }
@@ -316,6 +393,7 @@ async function resolveSavedStartupSelection(): Promise<StartupSelection | undefi
       provider: active.isPreset ? active.id : "custom",
       providerBaseUrl: active.baseUrl,
       providerApiKey: active.apiKey,
+      providerRequestHandlingMode: active.requestHandlingMode,
     },
   }
 }
@@ -323,13 +401,48 @@ async function resolveSavedStartupSelection(): Promise<StartupSelection | undefi
 export async function runSwitchConfiguration(): Promise<void> {
   await ensurePaths()
 
+  let syncTarget: ClaudeSettingsSyncTarget
+  try {
+    syncTarget = await promptClaudeSettingsSyncTarget(
+      DEFAULT_CLAUDE_SETTINGS_SYNC_TARGET,
+    )
+  } catch (error) {
+    if (error instanceof PromptBackError || error instanceof PromptExitError) {
+      return
+    }
+
+    throw error
+  }
+
+  consola.info(
+    `Claude settings sync target: ${describeClaudeSettingsSyncTarget(syncTarget)}`,
+  )
+
   let workingConfig = await loadStartupConfig()
 
   if (workingConfig.providers.length === 0) {
     consola.warn("No providers configured yet. Add a provider first in switch mode.")
-    const added = await runAddProviderFlow(workingConfig)
+    const added = await runAddProviderFlow(workingConfig, syncTarget)
     workingConfig = await loadStartupConfig()
     consola.info(`Initialized with provider ${added.providerOptions.provider || "custom"}`)
+  }
+
+  const sessionSlotSource = await resolveSwitchSessionSlotSource(
+    workingConfig,
+    syncTarget,
+  )
+
+  if (sessionSlotSource) {
+    consola.info(
+      `Loaded slot models from ${sessionSlotSource.path}: ${summarizeModelSlots(sessionSlotSource.slots)}`,
+    )
+  } else if (getActiveProviderProfile(workingConfig)) {
+    const targetLabel = syncTarget === "global"
+      ? "global"
+      : "local"
+    consola.warn(
+      `No slot models found in selected ${targetLabel} Claude settings file. Falling back to startup-config slot values.`,
+    )
   }
 
   let dirty = false
@@ -350,6 +463,8 @@ export async function runSwitchConfiguration(): Promise<void> {
           PROVIDER_ACTION_UPDATE,
           PROVIDER_ACTION_SWITCH,
           "Change model mappings",
+          PROVIDER_ACTION_DELETE_MODELS,
+          PROVIDER_ACTION_DELETE,
           "Save and exit",
           "Exit",
         ],
@@ -378,11 +493,7 @@ export async function runSwitchConfiguration(): Promise<void> {
         )
 
         if (exitDecision === "Save changes and exit") {
-          await persistSwitchConfig({
-            config: workingConfig,
-            sync: syncClaudeSettingsFromStartupConfig,
-            save: saveStartupConfig,
-          })
+          await persistSwitchConfigWithTarget(workingConfig, syncTarget)
           consola.success("Saved switch configuration.")
           return
         }
@@ -401,7 +512,7 @@ export async function runSwitchConfiguration(): Promise<void> {
     if (action === "Change model mappings") {
       let result
       try {
-        result = await runChangeModelDraft(workingConfig)
+        result = await runChangeModelDraft(workingConfig, sessionSlotSource)
       } catch (error) {
         if (error instanceof PromptBackError) {
           continue
@@ -424,11 +535,7 @@ export async function runSwitchConfiguration(): Promise<void> {
           )
 
           if (exitDecision === "Save changes and exit") {
-            await persistSwitchConfig({
-              config: workingConfig,
-              sync: syncClaudeSettingsFromStartupConfig,
-              save: saveStartupConfig,
-            })
+            await persistSwitchConfigWithTarget(workingConfig, syncTarget)
             consola.success("Saved switch configuration.")
             return
           }
@@ -445,45 +552,86 @@ export async function runSwitchConfiguration(): Promise<void> {
       }
 
       workingConfig = result.updatedConfig
-      dirty = true
+      dirty = dirty || result.changed
       continue
     }
 
     if (action === PROVIDER_ACTION_CONTINUE) {
-      await runContinueProviderFlow(workingConfig)
+      await runContinueProviderFlow(
+        workingConfig,
+        syncTarget,
+        sessionSlotSource,
+      )
       workingConfig = await loadStartupConfig()
       dirty = false
       continue
     }
 
     if (action === PROVIDER_ACTION_ADD) {
-      await runAddProviderFlow(workingConfig)
+      await runAddProviderFlow(workingConfig, syncTarget)
       workingConfig = await loadStartupConfig()
       dirty = false
       continue
     }
 
     if (action === PROVIDER_ACTION_UPDATE) {
-      await runUpdateProviderFlow(workingConfig)
+      await runUpdateProviderFlow(
+        workingConfig,
+        syncTarget,
+        undefined,
+        sessionSlotSource,
+      )
       workingConfig = await loadStartupConfig()
       dirty = false
       continue
     }
 
     if (action === PROVIDER_ACTION_SWITCH) {
-      await runSwitchProviderFlow(workingConfig)
+      await runSwitchProviderFlow(
+        workingConfig,
+        syncTarget,
+        sessionSlotSource,
+      )
       workingConfig = await loadStartupConfig()
       dirty = false
       continue
     }
 
+    if (action === PROVIDER_ACTION_DELETE_MODELS) {
+      await runDeleteModelMappingsFlow(
+        workingConfig,
+        syncTarget,
+        sessionSlotSource,
+      )
+      workingConfig = await loadStartupConfig()
+      dirty = false
+      continue
+    }
+
+    if (action === PROVIDER_ACTION_DELETE) {
+      await runDeleteProviderFlow(
+        workingConfig,
+        syncTarget,
+        sessionSlotSource,
+      )
+      workingConfig = await loadStartupConfig()
+      dirty = false
+
+      if (workingConfig.providers.length === 0) {
+        consola.warn("No providers configured yet. Add a provider first in switch mode.")
+        const added = await runAddProviderFlow(workingConfig, syncTarget)
+        workingConfig = await loadStartupConfig()
+        consola.info(
+          `Initialized with provider ${added.providerOptions.provider || "custom"}`,
+        )
+      }
+
+      continue
+    }
+
     if (action === "Save and exit") {
       if (dirty) {
-        await persistSwitchConfig({
-          config: workingConfig,
-          sync: syncClaudeSettingsFromStartupConfig,
-          save: saveStartupConfig,
-        })
+        await persistSwitchConfigWithTarget(workingConfig, syncTarget)
         consola.success("Saved switch configuration.")
       } else {
         consola.info("No changes to save.")
@@ -507,11 +655,7 @@ export async function runSwitchConfiguration(): Promise<void> {
     )
 
     if (exitDecision === "Save changes and exit") {
-      await persistSwitchConfig({
-        config: workingConfig,
-        sync: syncClaudeSettingsFromStartupConfig,
-        save: saveStartupConfig,
-      })
+      await persistSwitchConfigWithTarget(workingConfig, syncTarget)
       consola.success("Saved switch configuration.")
       return
     }
@@ -525,19 +669,20 @@ export async function runSwitchConfiguration(): Promise<void> {
 
 async function runChangeModelDraft(
   startupConfig: Awaited<ReturnType<typeof loadStartupConfig>>,
+  slotSource?: SwitchSessionSlotSource,
 ): Promise<{
   updatedConfig: Awaited<ReturnType<typeof loadStartupConfig>>
   activeProfile: ProviderProfile
   modelSlots: ModelSlots
+  changed: boolean
 }> {
   const active = getActiveProviderProfile(startupConfig)
   if (!active) {
     throw new Error("No active provider found. Add a provider before changing model slots.")
   }
 
-  let modelSlots = hasCompleteModelSlots(active.modelSlots)
-    ? normalizeModelSlots(active.modelSlots)
-    : normalizeModelSlots({
+  let modelSlots = resolveDisplayModelSlotsForProfile(active, slotSource)
+    || normalizeModelSlots({
       defaultModel: active.id === "openrouter" ? "qwen/qwen3.6-plus:free" : FALLBACK_MODEL,
       bigModel: active.id === "openrouter" ? "qwen/qwen3.6-plus:free" : FALLBACK_MODEL,
       sonnetModel: active.id === "openrouter" ? "qwen/qwen3.6-plus:free" : FALLBACK_MODEL,
@@ -545,6 +690,7 @@ async function runChangeModelDraft(
     })
 
   let updatedSlots = { ...modelSlots }
+  let didChange = false
 
   while (true) {
     let slotSelection: string
@@ -556,9 +702,10 @@ async function runChangeModelDraft(
           `opus (${summarizeRoutedModel(updatedSlots.bigModel)})`,
           `sonnet (${summarizeRoutedModel(updatedSlots.sonnetModel)})`,
           `haiku (${summarizeRoutedModel(updatedSlots.haikuModel)})`,
-          "Done",
+          "Save changes and return",
+          "Discard changes and return",
         ],
-        "Done",
+        "Save changes and return",
         { spacing: "major" },
       )
     } catch (error) {
@@ -567,12 +714,22 @@ async function runChangeModelDraft(
           updatedConfig: startupConfig,
           activeProfile: active,
           modelSlots,
+          changed: false,
         }
       }
       throw error
     }
 
-    if (slotSelection === "Done") {
+    if (slotSelection === "Discard changes and return") {
+      return {
+        updatedConfig: startupConfig,
+        activeProfile: active,
+        modelSlots,
+        changed: false,
+      }
+    }
+
+    if (slotSelection === "Save changes and return") {
       break
     }
 
@@ -608,11 +765,24 @@ async function runChangeModelDraft(
       throw error
     }
 
-    updatedSlots = setSlotModel(
-      updatedSlots,
-      slot,
-      encodeRoutedModel(selectedProviderId, selectedModel),
-    )
+    const nextValue = encodeRoutedModel(selectedProviderId, selectedModel)
+    if (getSlotModel(updatedSlots, slot) !== nextValue) {
+      updatedSlots = setSlotModel(
+        updatedSlots,
+        slot,
+        nextValue,
+      )
+      didChange = true
+    }
+  }
+
+  if (!didChange) {
+    return {
+      updatedConfig: startupConfig,
+      activeProfile: active,
+      modelSlots,
+      changed: false,
+    }
   }
 
   modelSlots = normalizeModelSlots(updatedSlots)
@@ -627,6 +797,7 @@ async function runChangeModelDraft(
     updatedConfig,
     activeProfile,
     modelSlots,
+    changed: true,
   }
 }
 
@@ -689,7 +860,11 @@ async function promptModelForProviderSlot(
     throw new Error(`Provider ${providerId} is not configured`)
   }
 
-  const availableModels = await fetchProviderModels(profile.baseUrl, profile.apiKey)
+  const availableModels = await fetchProviderModels(
+    profile.id,
+    profile.baseUrl,
+    profile.apiKey,
+  )
   if (availableModels.length === 0) {
     return await promptText(
       `Enter model id for ${slot}`,
@@ -742,29 +917,31 @@ async function fetchCopilotModelsForSlotSelection(): Promise<Array<string>> {
 
 async function runContinueProviderFlow(
   startupConfig: Awaited<ReturnType<typeof loadStartupConfig>>,
+  syncTarget: ClaudeSettingsSyncTarget,
+  slotSource?: SwitchSessionSlotSource,
 ): Promise<StartupSelection> {
   const active = getActiveProviderProfile(startupConfig)
 
   if (!active) {
-    return await runAddProviderFlow(startupConfig)
+    return await runAddProviderFlow(startupConfig, syncTarget)
   }
 
   const withActive = setActiveProvider(startupConfig, active.id)
-  await persistSwitchConfig({
-    config: withActive,
-    sync: syncClaudeSettingsFromStartupConfig,
-    save: saveStartupConfig,
-  })
+  await persistSwitchConfigWithTarget(withActive, syncTarget)
 
-  if (!hasCompleteModelSlots(active.modelSlots)) {
+  const modelSlots = resolveDisplayModelSlotsForProfile(active, slotSource)
+
+  if (!modelSlots) {
     consola.warn(
       `Provider ${active.label} is missing model slots. Updating models now.`,
     )
-    return await runUpdateProviderFlow(withActive, active.id)
+    return await runUpdateProviderFlow(withActive, syncTarget, active.id, slotSource)
   }
 
-  const modelSlots = normalizeModelSlots(active.modelSlots)
   consola.info(`Continuing with ${active.label} (${active.baseUrl})`)
+  consola.info(
+    `Request handling mode: ${formatRequestHandlingModeLabel(active.requestHandlingMode)}`,
+  )
   consola.info(`Selected models: ${summarizeModelSlots(modelSlots)}`)
 
   return buildSelectionFromProfile(active, modelSlots)
@@ -772,9 +949,13 @@ async function runContinueProviderFlow(
 
 async function runAddProviderFlow(
   startupConfig: Awaited<ReturnType<typeof loadStartupConfig>>,
+  syncTarget: ClaudeSettingsSyncTarget,
 ): Promise<StartupSelection> {
   const providerChoice = await promptProviderChoiceForAdd(startupConfig.providers)
   const apiKey = await promptProviderApiKey(providerChoice)
+  const requestHandlingMode = await promptRequestHandlingMode(
+    providerChoice.existingProfile?.requestHandlingMode,
+  )
 
   let modelSlots: ModelSlots
   let keepExistingModels = false
@@ -795,6 +976,7 @@ async function runAddProviderFlow(
     modelSlots = normalizeModelSlots(providerChoice.existingProfile.modelSlots)
   } else {
     const availableModels = await fetchProviderModels(
+      providerChoice.id,
       providerChoice.baseUrl,
       apiKey,
     )
@@ -811,6 +993,7 @@ async function runAddProviderFlow(
     apiKey,
     apiKeyUrl: providerChoice.apiKeyUrl,
     isPreset: providerChoice.isPreset,
+    requestHandlingMode,
     modelSlots,
     updatedAt: new Date().toISOString(),
   }
@@ -819,25 +1002,27 @@ async function runAddProviderFlow(
     upsertProviderProfile(startupConfig, updatedProfile),
     updatedProfile.id,
   )
-  await persistSwitchConfig({
-    config: updatedConfig,
-    sync: syncClaudeSettingsFromStartupConfig,
-    save: saveStartupConfig,
-  })
+  await persistSwitchConfigWithTarget(updatedConfig, syncTarget)
 
+  consola.info(
+    `Request handling mode: ${formatRequestHandlingModeLabel(requestHandlingMode)}`,
+  )
   consola.info(`Selected models: ${summarizeModelSlots(modelSlots)}`)
   return buildSelectionFromProfile(updatedProfile, modelSlots)
 }
 
 async function runUpdateProviderFlow(
   startupConfig: Awaited<ReturnType<typeof loadStartupConfig>>,
+  syncTarget: ClaudeSettingsSyncTarget,
   providerId?: string,
+  slotSource?: SwitchSessionSlotSource,
 ): Promise<StartupSelection> {
   const profile = providerId
     ? startupConfig.providers.find((provider) => provider.id === providerId)
     : await promptExistingProviderProfile(
       startupConfig.providers,
       "Search provider to update",
+      slotSource,
     )
 
   if (!profile) {
@@ -847,7 +1032,9 @@ async function runUpdateProviderFlow(
   const updateOptions = [
     "Update API key",
     "Update model slots",
+    "Update request handling mode",
     "Update API key and model slots",
+    "Update everything",
   ]
 
   const updateSelection = await promptSelect(
@@ -860,9 +1047,14 @@ async function runUpdateProviderFlow(
   const shouldUpdateApiKey =
     updateSelection === "Update API key"
     || updateSelection === "Update API key and model slots"
+    || updateSelection === "Update everything"
   const shouldUpdateModels =
     updateSelection === "Update model slots"
     || updateSelection === "Update API key and model slots"
+    || updateSelection === "Update everything"
+  const shouldUpdateRequestHandlingMode =
+    updateSelection === "Update request handling mode"
+    || updateSelection === "Update everything"
 
   const apiKey = shouldUpdateApiKey
     ? await promptProviderApiKey({
@@ -877,15 +1069,24 @@ async function runUpdateProviderFlow(
 
   let modelSlots: ModelSlots
   if (shouldUpdateModels || !hasCompleteModelSlots(profile.modelSlots)) {
-    const availableModels = await fetchProviderModels(profile.baseUrl, apiKey)
+    const availableModels = await fetchProviderModels(
+      profile.id,
+      profile.baseUrl,
+      apiKey,
+    )
     modelSlots = await promptModelSlots(availableModels, profile.modelSlots)
   } else {
     modelSlots = normalizeModelSlots(profile.modelSlots)
   }
 
+  const requestHandlingMode = shouldUpdateRequestHandlingMode
+    ? await promptRequestHandlingMode(profile.requestHandlingMode)
+    : normalizeProviderRequestHandlingMode(profile.requestHandlingMode)
+
   const updatedProfile: ProviderProfile = {
     ...profile,
     apiKey,
+    requestHandlingMode,
     modelSlots,
     updatedAt: new Date().toISOString(),
   }
@@ -894,22 +1095,24 @@ async function runUpdateProviderFlow(
     upsertProviderProfile(startupConfig, updatedProfile),
     updatedProfile.id,
   )
-  await persistSwitchConfig({
-    config: updatedConfig,
-    sync: syncClaudeSettingsFromStartupConfig,
-    save: saveStartupConfig,
-  })
+  await persistSwitchConfigWithTarget(updatedConfig, syncTarget)
 
+  consola.info(
+    `Request handling mode: ${formatRequestHandlingModeLabel(requestHandlingMode)}`,
+  )
   consola.info(`Selected models: ${summarizeModelSlots(modelSlots)}`)
   return buildSelectionFromProfile(updatedProfile, modelSlots)
 }
 
 async function runSwitchProviderFlow(
   startupConfig: Awaited<ReturnType<typeof loadStartupConfig>>,
+  syncTarget: ClaudeSettingsSyncTarget,
+  slotSource?: SwitchSessionSlotSource,
 ): Promise<StartupSelection> {
   const selectedProfile = await promptExistingProviderProfile(
     startupConfig.providers,
     "Search configured provider/model",
+    slotSource,
   )
 
   if (!selectedProfile) {
@@ -921,6 +1124,7 @@ async function runSwitchProviderFlow(
     modelSlots = normalizeModelSlots(selectedProfile.modelSlots)
   } else {
     const availableModels = await fetchProviderModels(
+      selectedProfile.id,
       selectedProfile.baseUrl,
       selectedProfile.apiKey,
     )
@@ -937,14 +1141,83 @@ async function runSwitchProviderFlow(
     upsertProviderProfile(startupConfig, refreshedProfile),
     refreshedProfile.id,
   )
-  await persistSwitchConfig({
-    config: updatedConfig,
-    sync: syncClaudeSettingsFromStartupConfig,
-    save: saveStartupConfig,
-  })
+  await persistSwitchConfigWithTarget(updatedConfig, syncTarget)
 
   consola.info(`Selected models: ${summarizeModelSlots(modelSlots)}`)
   return buildSelectionFromProfile(refreshedProfile, modelSlots)
+}
+
+async function runDeleteModelMappingsFlow(
+  startupConfig: Awaited<ReturnType<typeof loadStartupConfig>>,
+  syncTarget: ClaudeSettingsSyncTarget,
+  slotSource?: SwitchSessionSlotSource,
+): Promise<void> {
+  const profile = await promptExistingProviderProfile(
+    startupConfig.providers,
+    "Search provider model mappings to delete",
+    slotSource,
+  )
+
+  if (!profile) {
+    throw new Error("No configured provider found")
+  }
+
+  if (!hasCompleteModelSlots(profile.modelSlots)) {
+    consola.warn(`Provider ${profile.label} has no saved model mappings to delete.`)
+    return
+  }
+
+  const confirmed = await promptConfirm(
+    `Delete all model slot mappings for ${profile.label}?`,
+    false,
+  )
+
+  if (!confirmed) {
+    consola.info("Model mapping deletion cancelled.")
+    return
+  }
+
+  const updatedConfig = clearProviderModelSlots(startupConfig, profile.id)
+  await persistSwitchConfigWithTarget(updatedConfig, syncTarget)
+  consola.success(`Deleted model mappings for ${profile.label}.`)
+}
+
+async function runDeleteProviderFlow(
+  startupConfig: Awaited<ReturnType<typeof loadStartupConfig>>,
+  syncTarget: ClaudeSettingsSyncTarget,
+  slotSource?: SwitchSessionSlotSource,
+): Promise<void> {
+  const profile = await promptExistingProviderProfile(
+    startupConfig.providers,
+    "Search provider to delete",
+    slotSource,
+  )
+
+  if (!profile) {
+    throw new Error("No configured provider found")
+  }
+
+  const confirmed = await promptConfirm(
+    `Delete provider ${profile.label} and remove its API key + model configuration?`,
+    false,
+  )
+
+  if (!confirmed) {
+    consola.info("Provider deletion cancelled.")
+    return
+  }
+
+  const updatedConfig = removeProviderProfile(startupConfig, profile.id)
+  await persistSwitchConfigWithTarget(updatedConfig, syncTarget)
+
+  const nextActive = getActiveProviderProfile(updatedConfig)
+  consola.success(`Deleted provider ${profile.label} (${profile.id}).`)
+
+  if (nextActive) {
+    consola.info(`Active provider is now ${nextActive.label} (${nextActive.id}).`)
+  } else {
+    consola.warn("No providers remain configured.")
+  }
 }
 
 async function promptProviderChoiceForAdd(
@@ -1020,15 +1293,18 @@ async function promptProviderChoiceForAdd(
 async function promptExistingProviderProfile(
   profiles: Array<ProviderProfile>,
   promptMessage: string,
+  slotSource?: SwitchSessionSlotSource,
 ): Promise<ProviderProfile | undefined> {
   if (profiles.length === 0) {
     return undefined
   }
 
   const options: Array<SearchableOption> = profiles.map((profile) => {
-    const slotSummary = hasCompleteModelSlots(profile.modelSlots)
-      ? summarizeModelSlotsForList(normalizeModelSlots(profile.modelSlots))
+    const displaySlots = resolveDisplayModelSlotsForProfile(profile, slotSource)
+    const slotSummary = displaySlots
+      ? summarizeModelSlotsForList(displaySlots)
       : "models not configured"
+    const requestMode = formatRequestHandlingModeLabel(profile.requestHandlingMode)
 
     return {
       value: profile.id,
@@ -1037,8 +1313,8 @@ async function promptExistingProviderProfile(
         baseUrl: profile.baseUrl,
         isActive: false,
       }),
-      description: slotSummary,
-      searchText: `${profile.id} ${profile.label} ${profile.baseUrl} ${slotSummary}`,
+      description: `${slotSummary} | request mode: ${requestMode}`,
+      searchText: `${profile.id} ${profile.label} ${profile.baseUrl} ${slotSummary} ${requestMode}`,
     }
   })
 
@@ -1067,12 +1343,92 @@ function buildSelectionFromProfile(
       providerApiKey: profile.apiKey,
       providerModel: modelSlots.defaultModel,
       providerSmallModel: modelSlots.haikuModel,
+      providerRequestHandlingMode: profile.requestHandlingMode,
     },
     modelSlots,
   }
 }
 
+function describeClaudeSettingsSyncTarget(
+  target: ClaudeSettingsSyncTarget,
+): string {
+  if (target === "global") {
+    return "global (~/.claude/settings.json)"
+  }
+
+  return "local (.claude/settings.local.json)"
+}
+
+async function promptClaudeSettingsSyncTarget(
+  initialTarget: ClaudeSettingsSyncTarget,
+): Promise<ClaudeSettingsSyncTarget> {
+  const selected = await promptSelect(
+    "Sync Claude settings updates to",
+    [
+      {
+        value: "local",
+        label: "Local workspace settings",
+        description: "Update nearest .claude/settings.local.json in this workspace",
+        searchText: "local workspace settings.local.json",
+      },
+      {
+        value: "global",
+        label: "Global user settings",
+        description: "Update ~/.claude/settings.json for all Claude sessions",
+        searchText: "global user settings.json",
+      },
+    ],
+    initialTarget,
+    { spacing: "major" },
+  )
+
+  return selected === "global" ? "global" : "local"
+}
+
+function formatRequestHandlingModeLabel(mode?: string): string {
+  return normalizeProviderRequestHandlingMode(mode)
+}
+
+async function promptRequestHandlingMode(
+  initialMode?: string,
+): Promise<ProviderRequestHandlingMode> {
+  const normalizedInitial = normalizeProviderRequestHandlingMode(initialMode)
+  const selected = await promptSelect(
+    "Choose provider request handling mode",
+    [
+      {
+        value: "strict",
+        label: "strict",
+        description: "Exactly one upstream call (no auto retry or compatibility fallback)",
+        searchText: "single request one call no retry no fallback",
+      },
+      {
+        value: "balanced",
+        label: "balanced",
+        description: "Bounded retries and compatibility fallback with call budget",
+        searchText: "default retry fallback budget",
+      },
+      {
+        value: "resilient",
+        label: "resilient",
+        description: "Larger bounded retry budget with compatibility fallback",
+        searchText: "more retries robust",
+      },
+    ],
+    normalizedInitial,
+    { spacing: "minor" },
+  )
+
+  return normalizeProviderRequestHandlingMode(selected)
+}
+
 async function promptProviderApiKey(choice: ProviderChoice): Promise<string> {
+  if (choice.id === "vertex-ai") {
+    // For Vertex AI, apiKey field is repurposed to store the optional Project ID.
+    // BaseUrl field is repurposed to store the GCP region.
+    return ""
+  }
+
   const existingApiKey = choice.existingProfile?.apiKey
 
   if (existingApiKey) {
@@ -1098,9 +1454,17 @@ async function promptProviderApiKey(choice: ProviderChoice): Promise<string> {
 }
 
 async function fetchProviderModels(
+  providerId: string,
   baseUrl: string,
   apiKey: string,
 ): Promise<Array<string>> {
+  if (isGeminiAiStudioProvider(providerId, baseUrl)) {
+    const aiStudioModels = await fetchGeminiAiStudioModels(baseUrl, apiKey)
+    if (aiStudioModels.length > 0) {
+      return aiStudioModels
+    }
+  }
+
   try {
     const response = await fetch(`${baseUrl}/models`, {
       headers: {
@@ -1125,6 +1489,83 @@ async function fetchProviderModels(
       payload.data
         .map((model) => model.id)
         .filter((id): id is string => typeof id === "string" && id.length > 0),
+    )]
+  } catch {
+    return []
+  }
+}
+
+function isGeminiAiStudioProvider(providerId: string, baseUrl: string): boolean {
+  if (providerId.trim().toLowerCase() === "gemini") {
+    return true
+  }
+
+  return baseUrl.toLowerCase().includes("generativelanguage.googleapis.com")
+}
+
+function resolveGeminiNativeModelsUrl(baseUrl: string, apiKey: string): string {
+  const trimmedBase = baseUrl.replace(/\/+$/, "")
+
+  if (trimmedBase.endsWith("/openai")) {
+    return `${trimmedBase.slice(0, -"/openai".length)}/models?key=${encodeURIComponent(apiKey)}`
+  }
+
+  return `${trimmedBase}/models?key=${encodeURIComponent(apiKey)}`
+}
+
+async function fetchGeminiAiStudioModels(
+  baseUrl: string,
+  apiKey: string,
+): Promise<Array<string>> {
+  if (!apiKey.trim()) {
+    return []
+  }
+
+  try {
+    const response = await fetch(resolveGeminiNativeModelsUrl(baseUrl, apiKey), {
+      headers: {
+        accept: "application/json",
+      },
+    })
+
+    if (!response.ok) {
+      return []
+    }
+
+    const payload = (await response.json()) as {
+      models?: Array<{
+        name?: string
+        supportedGenerationMethods?: Array<string>
+      }>
+    }
+
+    if (!Array.isArray(payload.models)) {
+      return []
+    }
+
+    return [...new Set(
+      payload.models
+        .filter((model) => {
+          if (typeof model.name !== "string") {
+            return false
+          }
+
+          const methods = model.supportedGenerationMethods
+          if (!Array.isArray(methods)) {
+            return true
+          }
+
+          return methods.some((method) =>
+            method === "generateContent" || method === "streamGenerateContent",
+          )
+        })
+        .map((model) => model.name as string)
+        .filter((name) => name.startsWith("models/"))
+        .map((name) => name.slice("models/".length))
+        .filter((name) => name.toLowerCase().includes("gemini"))
+        .filter((name) => !name.toLowerCase().includes("embedding"))
+        .filter((name) => !name.toLowerCase().includes("aqa"))
+        .sort((a, b) => a.localeCompare(b)),
     )]
   } catch {
     return []
@@ -1370,7 +1811,7 @@ async function promptSelect(
 
             return `${status}\u001b[${trailing.length}D`
           },
-          keysHelpTip: () => "↑/↓ to select • Enter: confirm • Type: to search",
+          keysHelpTip: () => "Up/Down to select | Enter: confirm | Type: to search",
         },
       },
       pageSize: 14,
@@ -1600,6 +2041,11 @@ export const start = defineCommand({
       type: "string",
       description: "Preferred small model for provider mode",
     },
+    "provider-request-handling-mode": {
+      type: "string",
+      description:
+        "Provider request policy: strict, balanced, or resilient",
+    },
   },
   run({ args }) {
     const rateLimitRaw = args["rate-limit"]
@@ -1623,6 +2069,7 @@ export const start = defineCommand({
       providerApiKey: args["provider-api-key"],
       providerModel: args["provider-model"],
       providerSmallModel: args["provider-small-model"],
+      providerRequestHandlingMode: args["provider-request-handling-mode"],
     })
   },
 })

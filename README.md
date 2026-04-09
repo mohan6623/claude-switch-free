@@ -169,6 +169,7 @@ The following command line options are available for the `start` command:
 | --provider-api-key    | Override provider API key                                                                 | none       | none  |
 | --provider-model      | Preferred default model in provider mode                                                  | none       | none  |
 | --provider-small-model| Preferred small model in provider mode                                                    | none       | none  |
+| --provider-request-handling-mode | Provider request policy override: `strict`, `balanced`, `resilient`             | none       | none  |
 
 ### Interactive Startup Wizard
 
@@ -181,15 +182,24 @@ When no explicit `--provider*` overrides are passed, `start` launches an interac
    - `Update provider`
    - `Switch configured provider/model`
 3. For first-time setup or add-provider flow, select a preset provider or add a custom provider, then enter API key (preset providers display a direct API key URL)
-4. Configure model slots one by one using featured model suggestions plus search/manual entry:
+4. Choose a provider request handling mode (`strict`, `balanced`, or `resilient`)
+5. Configure model slots one by one using featured model suggestions plus search/manual entry:
   - default model
   - big model (Opus slot)
   - sonnet model
   - haiku model
   - prompts include inline search status and hint text (`Type: to search`) similar to OpenCode/OpenRouter terminal UX
-5. On later runs, existing provider configs can be reused directly without re-entering provider/model details.
+6. On later runs, existing provider configs can be reused directly without re-entering provider/model details.
 
 Provider and model slot choices are persisted and reused on next startup.
+
+When using `copilot-api switch`, you can choose where Claude env sync is written:
+- local workspace file (`.claude/settings.local.json`)
+- global user file (`~/.claude/settings.json`)
+
+On entering switch mode, the slot summary is loaded from the selected target with this read order:
+- local target: `.claude/settings.local.json`, then `.claude/settings.json`
+- global target: `~/.claude/settings.json`, then `~/.claude/settings.local.json`
 
 Startup output is concise by default and shows the configured slot summary (instead of printing every available provider model).
 
@@ -313,6 +323,7 @@ PROVIDER=opencode
 PROVIDER_API_KEY=YOUR_KEY
 PROVIDER_MODEL=qwen3.6-plus-free
 PROVIDER_SMALL_MODEL=qwen3.6-plus-free
+PROVIDER_REQUEST_HANDLING_MODE=balanced
 
 # Optional overrides
 PROVIDER_BASE_URL=https://opencode.ai/zen/v1
@@ -320,13 +331,13 @@ PROVIDER_BASE_URL=https://opencode.ai/zen/v1
 
 Supported presets and default base URLs:
 
-- `opencode` → `https://opencode.ai/zen/v1`
-- `openrouter` → `https://openrouter.ai/api/v1`
-- `groq` → `https://api.groq.com/openai/v1`
-- `xai` → `https://api.x.ai/v1`
-- `nvidia-nim` → `https://integrate.api.nvidia.com/v1`
-- `gemini` → `https://generativelanguage.googleapis.com/v1beta/openai`
-- `custom` → provide your own `--provider-base-url` / `PROVIDER_BASE_URL`
+- `opencode` -> `https://opencode.ai/zen/v1`
+- `openrouter` -> `https://openrouter.ai/api/v1`
+- `groq` -> `https://api.groq.com/openai/v1`
+- `xai` -> `https://api.x.ai/v1`
+- `nvidia-nim` -> `https://integrate.api.nvidia.com/v1`
+- `gemini` -> `https://generativelanguage.googleapis.com/v1beta/openai`
+- `custom` -> provide your own `--provider-base-url` / `PROVIDER_BASE_URL`
 
 Preset API key pages shown during startup:
 
@@ -336,6 +347,20 @@ Preset API key pages shown during startup:
 - `xai`: `https://console.x.ai/team/api-keys`
 - `nvidia-nim`: `https://build.nvidia.com/settings/api-keys`
 - `gemini`: `https://aistudio.google.com/app/apikey`
+
+### Provider Request Handling Modes
+
+Provider mode supports per-provider request policies:
+
+- `strict`: Exactly one upstream call per incoming request. No automatic 429 retry and no compatibility fallback retry.
+- `balanced` (default): Bounded 429 retries and compatibility fallback retries with a hard call budget.
+- `resilient`: Larger bounded retry budget and compatibility fallback retries, still bounded by a hard call budget.
+
+Set via switch wizard (recommended per provider), or with startup override:
+
+```sh
+npx copilot-api@latest start --provider openrouter --provider-api-key YOUR_KEY --provider-request-handling-mode strict
+```
 
 ## Using the Usage Viewer
 
@@ -426,6 +451,24 @@ bun run dev
 ```sh
 bun run start
 ```
+
+## Stable Global Snapshot (Dev-Safe)
+
+If you actively develop in this repo, your global `copilot-api` command can become linked to the workspace and break when local builds fail.
+
+Install a standalone stable snapshot (non-linked global install):
+
+```sh
+npm run stable:install
+```
+
+What this does:
+- builds `dist`
+- packs a tarball snapshot
+- removes any existing global link/install
+- installs a standalone global copy
+
+After this, `copilot-api` is runnable from any directory and is not affected by ongoing local development changes until you run `npm run stable:install` again.
 
 ## Usage Tips
 

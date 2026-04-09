@@ -30,6 +30,7 @@
     "prepack": "bun run build",
     "prepare": "simple-git-hooks",
     "release": "bumpp && bun publish --access public",
+    "stable:install": "node ./scripts/install-stable-global.mjs",
     "start": "NODE_ENV=production bun run ./src/main.ts",
     "typecheck": "tsc"
   },
@@ -45,6 +46,7 @@
     "clipboardy": "^5.0.0",
     "consola": "^3.4.2",
     "fetch-event-stream": "^0.1.5",
+    "google-auth-library": "^10.6.2",
     "gpt-tokenizer": "^3.0.1",
     "hono": "^4.9.9",
     "proxy-from-env": "^1.1.0",

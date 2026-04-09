@@ -1,19 +1,59 @@
 import consola from "consola"
 import { events } from "fetch-event-stream"
 
-import type { ProviderConfig } from "~/lib/provider-config"
+import {
+  DEFAULT_PROVIDER_REQUEST_HANDLING_MODE,
+  type ProviderConfig,
+  type ProviderRequestHandlingMode,
+} from "~/lib/provider-config"
 
 import { copilotHeaders, copilotBaseUrl } from "~/lib/api-config"
 import { HTTPError } from "~/lib/error"
 import { state } from "~/lib/state"
 import { sleep } from "~/lib/utils"
 
+import { GoogleAuth } from "google-auth-library"
+
 const providerQueueById = new Map<string, Promise<void>>()
 const providerCooldownUntilById = new Map<string, number>()
+const vertexAuth = new GoogleAuth({
+  scopes: ["https://www.googleapis.com/auth/cloud-platform"],
+})
 
 const DEFAULT_RATE_LIMIT_COOLDOWN_MS = 1_500
-const MAX_RATE_LIMIT_RETRIES = 2
-const MAX_AUTORETRY_DELAY_MS = 12_000
+const BALANCED_MAX_RATE_LIMIT_RETRIES = 2
+const BALANCED_MAX_AUTORETRY_DELAY_MS = 12_000
+
+interface ProviderRequestHandlingPolicy {
+  maxRateLimitRetries: number
+  maxAutoRetryDelayMs: number
+  maxTotalUpstreamCalls: number
+  allowCompatibilityFallback: boolean
+}
+
+const PROVIDER_REQUEST_HANDLING_POLICIES: Record<
+  ProviderRequestHandlingMode,
+  ProviderRequestHandlingPolicy
+> = {
+  strict: {
+    maxRateLimitRetries: 0,
+    maxAutoRetryDelayMs: 0,
+    maxTotalUpstreamCalls: 1,
+    allowCompatibilityFallback: false,
+  },
+  balanced: {
+    maxRateLimitRetries: BALANCED_MAX_RATE_LIMIT_RETRIES,
+    maxAutoRetryDelayMs: BALANCED_MAX_AUTORETRY_DELAY_MS,
+    maxTotalUpstreamCalls: 4,
+    allowCompatibilityFallback: true,
+  },
+  resilient: {
+    maxRateLimitRetries: 4,
+    maxAutoRetryDelayMs: 20_000,
+    maxTotalUpstreamCalls: 6,
+    allowCompatibilityFallback: true,
+  },
+}
 
 export const createChatCompletions = async (
   payload: ChatCompletionsPayload,
@@ -21,7 +61,7 @@ export const createChatCompletions = async (
 ) => {
   const effectiveProvider = providerOverride || state.provider
 
-  if (effectiveProvider.mode === "openai-compatible") {
+  if (effectiveProvider.mode === "openai-compatible" || effectiveProvider.mode === "vertex-ai") {
     return await createOpenAICompatibleChatCompletions(
       payload,
       effectiveProvider,
@@ -55,6 +95,16 @@ export const createChatCompletions = async (
   })
 
   if (!response.ok) {
+    const errorText = await response.clone().text()
+
+    if (shouldRetryCopilotViaResponses(response.status, errorText)) {
+      consola.warn(
+        `Copilot model ${payload.model} is not available via /chat/completions. Retrying with /responses compatibility fallback.`,
+      )
+
+      return await createCopilotResponsesFallback(payload, headers)
+    }
+
     consola.error("Failed to create chat completions", response)
     throw new HTTPError("Failed to create chat completions", response)
   }
@@ -66,25 +116,1154 @@ export const createChatCompletions = async (
   return (await response.json()) as ChatCompletionResponse
 }
 
+interface CopilotResponsesTextInputPart {
+  type: "text"
+  text: string
+}
+
+interface CopilotResponsesAssistantTextInputPart {
+  type: "output_text"
+  text: string
+}
+
+interface CopilotResponsesImageInputPart {
+  type: "input_image"
+  image_url: string
+  detail?: "low" | "high" | "auto"
+}
+
+type CopilotResponsesInputPart =
+  | CopilotResponsesTextInputPart
+  | CopilotResponsesAssistantTextInputPart
+  | CopilotResponsesImageInputPart
+
+type CopilotResponsesInputItem =
+  | {
+      role: "system" | "user" | "assistant"
+      content: Array<CopilotResponsesInputPart>
+    }
+  | {
+      type: "function_call"
+      call_id: string
+      name: string
+      arguments: string
+    }
+  | {
+      type: "function_call_output"
+      call_id: string
+      output: string
+    }
+
+interface CopilotResponsesTool {
+  type: "function"
+  name: string
+  description?: string
+  parameters: Record<string, unknown>
+}
+
+interface CopilotResponsesRequest {
+  model: string
+  input: Array<CopilotResponsesInputItem>
+  stream: boolean
+  temperature?: number
+  top_p?: number
+  max_output_tokens?: number
+  tools?: Array<CopilotResponsesTool>
+  tool_choice?: "none" | "auto" | "required" | { type: "function"; name: string }
+}
+
+async function createCopilotResponsesFallback(
+  payload: ChatCompletionsPayload,
+  headers: Record<string, string>,
+): Promise<ChatCompletionResponse | AsyncIterable<{ data: string }>> {
+  const response = await fetch(`${copilotBaseUrl(state)}/responses`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify(buildCopilotResponsesPayload(payload)),
+  })
+
+  if (!response.ok) {
+    consola.error("Failed to create chat completions", response)
+    throw new HTTPError("Failed to create chat completions", response)
+  }
+
+  const parsed = (await response.json()) as unknown
+  const chatCompletion = mapResponsesToChatCompletion(parsed, payload.model)
+
+  if (payload.stream) {
+    return createSyntheticChatCompletionStream(chatCompletion)
+  }
+
+  return chatCompletion
+}
+
+function buildCopilotResponsesPayload(
+  payload: ChatCompletionsPayload,
+): CopilotResponsesRequest {
+  const request: CopilotResponsesRequest = {
+    model: payload.model,
+    input: mapMessagesToResponsesInput(payload.messages),
+    // We request a non-stream response and synthesize chat-completions SSE locally
+    // when callers asked for stream mode.
+    stream: false,
+  }
+
+  if (typeof payload.temperature === "number") {
+    request.temperature = payload.temperature
+  }
+
+  if (typeof payload.top_p === "number") {
+    request.top_p = payload.top_p
+  }
+
+  if (typeof payload.max_tokens === "number") {
+    request.max_output_tokens = payload.max_tokens
+  }
+
+  const mappedTools = mapToolsToResponsesTools(payload.tools)
+  if (mappedTools) {
+    request.tools = mappedTools
+  }
+
+  const mappedToolChoice = mapToolChoiceToResponsesToolChoice(payload.tool_choice)
+  if (mappedToolChoice) {
+    request.tool_choice = mappedToolChoice
+  }
+
+  return request
+}
+
+function mapMessagesToResponsesInput(
+  messages: Array<Message>,
+): Array<CopilotResponsesInputItem> {
+  const input: Array<CopilotResponsesInputItem> = []
+
+  for (const message of messages) {
+    if (message.role === "tool") {
+      input.push({
+        type: "function_call_output",
+        call_id: message.tool_call_id || message.name || "tool-output",
+        output: flattenMessageContentToText(message.content),
+      })
+      continue
+    }
+
+    const role =
+      message.role === "developer" ?
+        "system"
+      : message.role
+
+    if (role === "system" || role === "user" || role === "assistant") {
+      const contentParts = mapMessageContentToResponsesInput(
+        message.content,
+        role,
+      )
+
+      const emptyContentPart: CopilotResponsesInputPart =
+        role === "assistant" ?
+          {
+            type: "output_text",
+            text: "",
+          }
+        : {
+            type: "text",
+            text: "",
+          }
+
+      input.push({
+        role,
+        content:
+          contentParts.length > 0 ?
+            contentParts
+          : [emptyContentPart],
+      })
+    }
+
+    if (role === "assistant" && message.tool_calls) {
+      for (const toolCall of message.tool_calls) {
+        input.push({
+          type: "function_call",
+          call_id: toolCall.id,
+          name: toolCall.function.name,
+          arguments: toolCall.function.arguments,
+        })
+      }
+    }
+  }
+
+  return input
+}
+
+function mapMessageContentToResponsesInput(
+  content: Message["content"],
+  role: "system" | "user" | "assistant",
+): Array<CopilotResponsesInputPart> {
+  if (role === "assistant") {
+    if (typeof content === "string") {
+      return [{ type: "output_text", text: content }]
+    }
+
+    if (!Array.isArray(content)) {
+      return []
+    }
+
+    return content
+      .filter((part): part is TextPart => part.type === "text")
+      .map((part) => ({
+        type: "output_text" as const,
+        text: part.text,
+      }))
+  }
+
+  if (typeof content === "string") {
+    return [{ type: "text", text: content }]
+  }
+
+  if (!Array.isArray(content)) {
+    return []
+  }
+
+  const mapped: Array<CopilotResponsesInputPart> = []
+
+  for (const part of content) {
+    if (part.type === "text") {
+      mapped.push({
+        type: "text",
+        text: part.text,
+      })
+      continue
+    }
+
+    mapped.push({
+      type: "input_image",
+      image_url: part.image_url.url,
+      detail: part.image_url.detail,
+    })
+  }
+
+  return mapped
+}
+
+function mapToolsToResponsesTools(
+  tools: Array<Tool> | null | undefined,
+): Array<CopilotResponsesTool> | undefined {
+  if (!tools || tools.length === 0) {
+    return undefined
+  }
+
+  return tools.map((tool) => ({
+    type: "function",
+    name: tool.function.name,
+    description: tool.function.description,
+    parameters: tool.function.parameters,
+  }))
+}
+
+function mapToolChoiceToResponsesToolChoice(
+  toolChoice: ChatCompletionsPayload["tool_choice"],
+): "none" | "auto" | "required" | { type: "function"; name: string } | undefined {
+  if (!toolChoice) {
+    return undefined
+  }
+
+  if (
+    toolChoice === "none"
+    || toolChoice === "auto"
+    || toolChoice === "required"
+  ) {
+    return toolChoice
+  }
+
+  if (toolChoice.type === "function") {
+    return {
+      type: "function",
+      name: toolChoice.function.name,
+    }
+  }
+
+  return undefined
+}
+
+function flattenMessageContentToText(content: Message["content"]): string {
+  if (typeof content === "string") {
+    return content
+  }
+
+  if (!Array.isArray(content)) {
+    return ""
+  }
+
+  return content
+    .filter((part): part is TextPart => part.type === "text")
+    .map((part) => part.text)
+    .join("\n")
+}
+
+function mapResponsesToChatCompletion(
+  input: unknown,
+  fallbackModel: string,
+): ChatCompletionResponse {
+  const nowEpochSeconds = Math.floor(Date.now() / 1000)
+  const source = asRecord(input)
+
+  const usage = asRecord(source.usage)
+  const promptTokens = asInteger(usage.input_tokens)
+  const completionTokens = asInteger(usage.output_tokens)
+
+  const output = Array.isArray(source.output) ? source.output : []
+  const textSegments: Array<string> = []
+  const toolCalls: Array<ToolCall> = []
+
+  for (const item of output) {
+    const outputItem = asRecord(item)
+    const itemType = asString(outputItem.type)
+
+    if (itemType === "message") {
+      const content = Array.isArray(outputItem.content) ? outputItem.content : []
+      for (const part of content) {
+        const contentPart = asRecord(part)
+        const partType = asString(contentPart.type)
+
+        if (partType === "output_text" || partType === "text") {
+          const text = asString(contentPart.text)
+          if (text) {
+            textSegments.push(text)
+          }
+        }
+      }
+    }
+
+    if (itemType === "output_text") {
+      const text = asString(outputItem.text)
+      if (text) {
+        textSegments.push(text)
+      }
+    }
+
+    if (itemType === "function_call") {
+      const callId = asString(outputItem.call_id) || asString(outputItem.id) || "tool-call"
+      const name = asString(outputItem.name) || "tool"
+      const argumentsValue = outputItem.arguments
+
+      let argumentsText = "{}"
+      if (typeof argumentsValue === "string") {
+        argumentsText = argumentsValue
+      } else if (isRecord(argumentsValue) || Array.isArray(argumentsValue)) {
+        argumentsText = JSON.stringify(argumentsValue)
+      }
+
+      toolCalls.push({
+        id: callId,
+        type: "function",
+        function: {
+          name,
+          arguments: argumentsText,
+        },
+      })
+    }
+  }
+
+  if (textSegments.length === 0) {
+    const outputText = source.output_text
+    if (typeof outputText === "string" && outputText) {
+      textSegments.push(outputText)
+    }
+  }
+
+  const content = textSegments.join("") || null
+
+  return {
+    id: asString(source.id) || "response-fallback",
+    object: "chat.completion",
+    created: nowEpochSeconds,
+    model: asString(source.model) || fallbackModel,
+    choices: [
+      {
+        index: 0,
+        message: {
+          role: "assistant",
+          content,
+          ...(toolCalls.length > 0 && { tool_calls: toolCalls }),
+        },
+        logprobs: null,
+        finish_reason: toolCalls.length > 0 ? "tool_calls" : "stop",
+      },
+    ],
+    usage: {
+      prompt_tokens: promptTokens,
+      completion_tokens: completionTokens,
+      total_tokens:
+        asInteger(usage.total_tokens) || promptTokens + completionTokens,
+    },
+  }
+}
+
+function createSyntheticChatCompletionStream(
+  response: ChatCompletionResponse,
+): AsyncIterable<{ data: string }> {
+  return (async function* () {
+    const choice = response.choices[0]
+    const toolCalls = choice?.message.tool_calls?.map((toolCall, index) => ({
+      index,
+      id: toolCall.id,
+      type: "function" as const,
+      function: {
+        name: toolCall.function.name,
+        arguments: toolCall.function.arguments,
+      },
+    }))
+
+    const chunk: ChatCompletionChunk = {
+      id: response.id,
+      object: "chat.completion.chunk",
+      created: response.created,
+      model: response.model,
+      choices: [
+        {
+          index: 0,
+          delta: {
+            role: "assistant",
+            ...(choice?.message.content && {
+              content: choice.message.content,
+            }),
+            ...(toolCalls && toolCalls.length > 0 && {
+              tool_calls: toolCalls,
+            }),
+          },
+          finish_reason: choice?.finish_reason || "stop",
+          logprobs: null,
+        },
+      ],
+      ...(response.usage && {
+        usage: {
+          prompt_tokens: response.usage.prompt_tokens,
+          completion_tokens: response.usage.completion_tokens,
+          total_tokens: response.usage.total_tokens,
+        },
+      }),
+    }
+
+    yield {
+      data: JSON.stringify(chunk),
+    }
+
+    yield {
+      data: "[DONE]",
+    }
+  })()
+}
+
+function shouldRetryCopilotViaResponses(
+  status: number,
+  errorText: string,
+): boolean {
+  if (status !== 400) {
+    return false
+  }
+
+  const normalized = errorText.toLowerCase()
+
+  if (normalized.includes("model_not_supported")) {
+    return true
+  }
+
+  if (normalized.includes("requested model is not supported")) {
+    return true
+  }
+
+  return (
+    normalized.includes("unsupported_api_for_model")
+    && normalized.includes("/chat/completions")
+  )
+}
+
+function asRecord(input: unknown): Record<string, unknown> {
+  if (!isRecord(input)) {
+    return {}
+  }
+
+  return input
+}
+
+function isRecord(input: unknown): input is Record<string, unknown> {
+  return Boolean(input) && typeof input === "object" && !Array.isArray(input)
+}
+
+function asString(value: unknown): string | undefined {
+  return typeof value === "string" ? value : undefined
+}
+
+function asInteger(value: unknown): number {
+  const numeric = typeof value === "number" ? value : Number(value)
+  return Number.isFinite(numeric) ? Math.max(0, numeric) : 0
+}
+
+interface GeminiNativeGenerationConfig {
+  temperature?: number
+  topP?: number
+  maxOutputTokens?: number
+  stopSequences?: Array<string>
+}
+
+interface GeminiNativeFunctionDeclaration {
+  name: string
+  description?: string
+  parameters: Record<string, unknown>
+}
+
+interface GeminiNativeToolDeclaration {
+  functionDeclarations: Array<GeminiNativeFunctionDeclaration>
+}
+
+interface GeminiNativeFunctionCallPart {
+  functionCall: {
+    name: string
+    args?: unknown
+  }
+  thoughtSignature?: string
+  thought_signature?: string
+}
+
+interface GeminiNativeFunctionResponsePart {
+  functionResponse: {
+    name: string
+    response: unknown
+  }
+}
+
+interface GeminiNativeTextPart {
+  text: string
+}
+
+interface GeminiNativeInlineDataPart {
+  inlineData: {
+    mimeType: string
+    data: string
+  }
+}
+
+interface GeminiNativeFileDataPart {
+  fileData: {
+    fileUri: string
+  }
+}
+
+type GeminiNativePart =
+  | GeminiNativeFunctionCallPart
+  | GeminiNativeFunctionResponsePart
+  | GeminiNativeTextPart
+  | GeminiNativeInlineDataPart
+  | GeminiNativeFileDataPart
+
+interface GeminiNativeContent {
+  role: "user" | "model"
+  parts: Array<GeminiNativePart>
+}
+
+interface GeminiNativeRequest {
+  contents: Array<GeminiNativeContent>
+  systemInstruction?: {
+    parts: Array<{ text: string }>
+  }
+  generationConfig?: GeminiNativeGenerationConfig
+  tools?: Array<GeminiNativeToolDeclaration>
+  toolConfig?: {
+    functionCallingConfig: {
+      mode: "AUTO" | "ANY" | "NONE"
+      allowedFunctionNames?: Array<string>
+    }
+  }
+}
+
+const GEMINI_UNSUPPORTED_SCHEMA_KEYS = new Set([
+  "additionalProperties",
+  "unevaluatedProperties",
+  "propertyNames",
+  "patternProperties",
+  "$schema",
+  "$defs",
+  "definitions",
+  "const",
+  "exclusiveMinimum",
+  "exclusiveMaximum",
+  "unevaluatedItems",
+  "contains",
+  "dependentRequired",
+  "dependentSchemas",
+  "if",
+  "then",
+  "else",
+  "not",
+])
+
+function isGeminiAiStudioNativeProvider(provider: ProviderConfig): boolean {
+  if (provider.mode !== "openai-compatible") {
+    return false
+  }
+
+  if (provider.id === "gemini") {
+    return true
+  }
+
+  return (provider.baseUrl || "")
+    .toLowerCase()
+    .includes("generativelanguage.googleapis.com")
+}
+
+function resolveGeminiNativeBaseUrl(baseUrl: string): string {
+  const trimmed = baseUrl.replace(/\/+$/, "")
+  if (trimmed.endsWith("/openai")) {
+    return trimmed.slice(0, -"/openai".length)
+  }
+
+  return trimmed
+}
+
+function normalizeGeminiModelId(model: string): string {
+  return model.startsWith("models/")
+    ? model.slice("models/".length)
+    : model
+}
+
+const GEMINI_TOOL_CALLING_MODEL_COMPATIBILITY: Readonly<
+  Record<string, string>
+> = {
+  "gemini-3.1-pro-preview": "gemini-3.1-pro-preview-customtools",
+}
+
+const GEMINI_THOUGHT_SIGNATURE_DELIMITER = "::cpapi-thoughtsig:"
+
+function encodeGeminiToolCallId(
+  baseId: string,
+  thoughtSignature: string | undefined,
+): string {
+  if (!thoughtSignature) {
+    return baseId
+  }
+
+  return `${baseId}${GEMINI_THOUGHT_SIGNATURE_DELIMITER}${encodeURIComponent(thoughtSignature)}`
+}
+
+function decodeGeminiToolCallId(toolCallId: string): {
+  baseId: string
+  thoughtSignature?: string
+} {
+  const markerIndex = toolCallId.indexOf(GEMINI_THOUGHT_SIGNATURE_DELIMITER)
+  if (markerIndex < 0) {
+    return { baseId: toolCallId }
+  }
+
+  const baseId = toolCallId.slice(0, markerIndex) || toolCallId
+  const encodedSignature = toolCallId.slice(
+    markerIndex + GEMINI_THOUGHT_SIGNATURE_DELIMITER.length,
+  )
+
+  if (!encodedSignature) {
+    return { baseId }
+  }
+
+  try {
+    return {
+      baseId,
+      thoughtSignature: decodeURIComponent(encodedSignature),
+    }
+  } catch {
+    return {
+      baseId,
+      thoughtSignature: encodedSignature,
+    }
+  }
+}
+
+function resolveGeminiToolCallingModel(
+  model: string,
+  payload: ChatCompletionsPayload,
+): string {
+  const normalized = normalizeGeminiModelId(model)
+  if (!payload.tools || payload.tools.length === 0) {
+    return normalized
+  }
+
+  return GEMINI_TOOL_CALLING_MODEL_COMPATIBILITY[normalized] || normalized
+}
+
+function parseDataUri(
+  value: string,
+): { mimeType: string; base64: string } | undefined {
+  const match = value.match(/^data:([^;,]+);base64,(.+)$/i)
+  if (!match?.[1] || !match[2]) {
+    return undefined
+  }
+
+  return {
+    mimeType: match[1],
+    base64: match[2],
+  }
+}
+
+function normalizeStopSequences(
+  stop: ChatCompletionsPayload["stop"],
+): Array<string> | undefined {
+  if (!stop) {
+    return undefined
+  }
+
+  if (typeof stop === "string") {
+    return stop.length > 0 ? [stop] : undefined
+  }
+
+  const filtered = stop.filter((item) => typeof item === "string" && item.length > 0)
+  return filtered.length > 0 ? filtered : undefined
+}
+
+function parseToolOutput(value: string): unknown {
+  const text = value.trim()
+  if (!text) {
+    return { content: "" }
+  }
+
+  try {
+    return JSON.parse(text) as unknown
+  } catch {
+    return { content: text }
+  }
+}
+
+function parseGeminiToolResponse(value: string): Record<string, unknown> {
+  const parsed = parseToolOutput(value)
+
+  if (isRecord(parsed)) {
+    return parsed
+  }
+
+  if (Array.isArray(parsed)) {
+    return { data: parsed }
+  }
+
+  return { content: parsed }
+}
+
+function sanitizeGeminiSchema(input: unknown): unknown {
+  return sanitizeGeminiSchemaValue(input)
+}
+
+function sanitizeGeminiSchemaValue(
+  input: unknown,
+  context?: { preserveKeys?: boolean },
+): unknown {
+  if (Array.isArray(input)) {
+    return input.map((item) => sanitizeGeminiSchemaValue(item, context))
+  }
+
+  if (!isRecord(input)) {
+    return input
+  }
+
+  const sanitized: Record<string, unknown> = {}
+
+  for (const [key, value] of Object.entries(input)) {
+    if (!context?.preserveKeys && GEMINI_UNSUPPORTED_SCHEMA_KEYS.has(key)) {
+      continue
+    }
+
+    const nextContext =
+      key === "properties" || key === "patternProperties"
+        ? { preserveKeys: true }
+        : undefined
+
+    sanitized[key] = sanitizeGeminiSchemaValue(value, nextContext)
+  }
+
+  return sanitized
+}
+
+function mapGeminiToolChoice(
+  toolChoice: ChatCompletionsPayload["tool_choice"],
+): GeminiNativeRequest["toolConfig"] {
+  if (!toolChoice || toolChoice === "auto") {
+    return {
+      functionCallingConfig: {
+        mode: "AUTO",
+      },
+    }
+  }
+
+  if (toolChoice === "none") {
+    return {
+      functionCallingConfig: {
+        mode: "NONE",
+      },
+    }
+  }
+
+  if (toolChoice === "required") {
+    return {
+      functionCallingConfig: {
+        mode: "ANY",
+      },
+    }
+  }
+
+  return {
+    functionCallingConfig: {
+      mode: "ANY",
+      allowedFunctionNames: [toolChoice.function.name],
+    },
+  }
+}
+
+function buildGeminiNativeRequest(
+  payload: ChatCompletionsPayload,
+): GeminiNativeRequest {
+  const toolNameByCallId = new Map<string, string>()
+
+  for (const message of payload.messages) {
+    if (message.role !== "assistant" || !message.tool_calls) {
+      continue
+    }
+
+    for (const toolCall of message.tool_calls) {
+      const decodedToolCallId = decodeGeminiToolCallId(toolCall.id)
+      toolNameByCallId.set(toolCall.id, toolCall.function.name)
+      toolNameByCallId.set(decodedToolCallId.baseId, toolCall.function.name)
+    }
+  }
+
+  const systemTexts: Array<string> = []
+  const contents: Array<GeminiNativeContent> = []
+
+  for (const message of payload.messages) {
+    if (message.role === "system" || message.role === "developer") {
+      const text = flattenMessageContentToText(message.content)
+      if (text.trim().length > 0) {
+        systemTexts.push(text)
+      }
+      continue
+    }
+
+    if (message.role === "tool") {
+      const callId = message.tool_call_id || message.name || "tool"
+      const decodedCallId = decodeGeminiToolCallId(callId)
+      const toolName =
+        toolNameByCallId.get(callId)
+        || toolNameByCallId.get(decodedCallId.baseId)
+        || message.name
+        || "tool"
+      const responseText = flattenMessageContentToText(message.content)
+
+      contents.push({
+        role: "user",
+        parts: [
+          {
+            functionResponse: {
+              name: toolName,
+              response: parseGeminiToolResponse(responseText),
+            },
+          },
+        ],
+      })
+      continue
+    }
+
+    const parts: Array<GeminiNativePart> = []
+
+    if (typeof message.content === "string") {
+      parts.push({ text: message.content })
+    } else if (Array.isArray(message.content)) {
+      for (const part of message.content) {
+        if (part.type === "text") {
+          parts.push({ text: part.text })
+          continue
+        }
+
+        const imageUrl = part.image_url.url
+        const dataUri = parseDataUri(imageUrl)
+        if (dataUri) {
+          parts.push({
+            inlineData: {
+              mimeType: dataUri.mimeType,
+              data: dataUri.base64,
+            },
+          })
+        } else {
+          parts.push({
+            fileData: {
+              fileUri: imageUrl,
+            },
+          })
+        }
+      }
+    }
+
+    if (message.role === "assistant" && message.tool_calls) {
+      for (const toolCall of message.tool_calls) {
+        const decodedToolCallId = decodeGeminiToolCallId(toolCall.id)
+        const functionCallPart: GeminiNativeFunctionCallPart = {
+          functionCall: {
+            name: toolCall.function.name,
+            args: parseToolOutput(toolCall.function.arguments),
+          },
+        }
+
+        if (decodedToolCallId.thoughtSignature) {
+          functionCallPart.thoughtSignature = decodedToolCallId.thoughtSignature
+        }
+
+        parts.push({
+          ...functionCallPart,
+        })
+      }
+    }
+
+    contents.push({
+      role: message.role === "assistant" ? "model" : "user",
+      parts: parts.length > 0 ? parts : [{ text: "" }],
+    })
+  }
+
+  const request: GeminiNativeRequest = {
+    contents,
+  }
+
+  if (systemTexts.length > 0) {
+    request.systemInstruction = {
+      parts: [{ text: systemTexts.join("\n\n") }],
+    }
+  }
+
+  const generationConfig: GeminiNativeGenerationConfig = {}
+
+  if (typeof payload.temperature === "number") {
+    generationConfig.temperature = payload.temperature
+  }
+
+  if (typeof payload.top_p === "number") {
+    generationConfig.topP = payload.top_p
+  }
+
+  if (typeof payload.max_tokens === "number") {
+    generationConfig.maxOutputTokens = payload.max_tokens
+  }
+
+  const stopSequences = normalizeStopSequences(payload.stop)
+  if (stopSequences) {
+    generationConfig.stopSequences = stopSequences
+  }
+
+  if (Object.keys(generationConfig).length > 0) {
+    request.generationConfig = generationConfig
+  }
+
+  if (payload.tools && payload.tools.length > 0) {
+    request.tools = [
+      {
+        functionDeclarations: payload.tools.map((tool) => ({
+          name: tool.function.name,
+          description: tool.function.description,
+          parameters:
+            (sanitizeGeminiSchema(tool.function.parameters) as Record<string, unknown>)
+            || {},
+        })),
+      },
+    ]
+
+    request.toolConfig = mapGeminiToolChoice(payload.tool_choice)
+  }
+
+  return request
+}
+
+function mapGeminiFinishReason(
+  value: unknown,
+): "stop" | "length" | "tool_calls" | "content_filter" {
+  const normalized = String(value || "").toUpperCase()
+
+  if (normalized === "MAX_TOKENS") {
+    return "length"
+  }
+
+  if (normalized === "SAFETY" || normalized === "RECITATION") {
+    return "content_filter"
+  }
+
+  if (normalized === "TOOL_CALLS") {
+    return "tool_calls"
+  }
+
+  return "stop"
+}
+
+function mapGeminiNativeResponseToChatCompletion(
+  input: unknown,
+  fallbackModel: string,
+): ChatCompletionResponse {
+  const source = asRecord(input)
+  const candidates = Array.isArray(source.candidates) ? source.candidates : []
+  const firstCandidate = asRecord(candidates[0])
+  const firstContent = asRecord(firstCandidate.content)
+  const firstParts = Array.isArray(firstContent.parts) ? firstContent.parts : []
+
+  const textParts: Array<string> = []
+  const toolCalls: Array<ToolCall> = []
+
+  for (let i = 0; i < firstParts.length; i = i + 1) {
+    const part = asRecord(firstParts[i])
+
+    const text = asString(part.text)
+    if (text) {
+      textParts.push(text)
+      continue
+    }
+
+    const functionCall = asRecord(part.functionCall)
+    const functionName = asString(functionCall.name)
+    if (!functionName) {
+      continue
+    }
+
+    const thoughtSignature =
+      asString(part.thoughtSignature)
+      || asString(part.thought_signature)
+      ||
+      asString(functionCall.thoughtSignature)
+      || asString(functionCall.thought_signature)
+
+    const args = functionCall.args
+    let argumentsText = "{}"
+    if (typeof args === "string") {
+      argumentsText = args
+    } else if (isRecord(args) || Array.isArray(args)) {
+      argumentsText = JSON.stringify(args)
+    }
+
+    const baseToolCallId = asString(functionCall.id) || `gemini-tool-${i}`
+
+    toolCalls.push({
+      id: encodeGeminiToolCallId(baseToolCallId, thoughtSignature),
+      type: "function",
+      function: {
+        name: functionName,
+        arguments: argumentsText,
+      },
+    })
+  }
+
+  const usage = asRecord(source.usageMetadata)
+  const finishReason = mapGeminiFinishReason(firstCandidate.finishReason)
+
+  return {
+    id: asString(source.responseId) || asString(source.id) || `gemini-${Date.now()}`,
+    object: "chat.completion",
+    created: Math.floor(Date.now() / 1000),
+    model: normalizeGeminiModelId(asString(source.modelVersion) || fallbackModel),
+    choices: [
+      {
+        index: 0,
+        message: {
+          role: "assistant",
+          content: textParts.join("") || null,
+          ...(toolCalls.length > 0 && { tool_calls: toolCalls }),
+        },
+        logprobs: null,
+        finish_reason: toolCalls.length > 0 ? "tool_calls" : finishReason,
+      },
+    ],
+    usage: {
+      prompt_tokens: asInteger(usage.promptTokenCount),
+      completion_tokens: asInteger(usage.candidatesTokenCount),
+      total_tokens: asInteger(usage.totalTokenCount),
+    },
+  }
+}
+
+async function createGeminiNativeChatCompletions(
+  payload: ChatCompletionsPayload,
+  provider: ProviderConfig,
+): Promise<ChatCompletionResponse | AsyncIterable<{ data: string }>> {
+  if (!provider.baseUrl || !provider.apiKey) {
+    throw new Error(
+      "Gemini provider requires base URL and API key",
+    )
+  }
+
+  const baseUrl = resolveGeminiNativeBaseUrl(provider.baseUrl)
+  const modelId = resolveGeminiToolCallingModel(payload.model, payload)
+  const url = `${baseUrl}/models/${encodeURIComponent(modelId)}:generateContent?key=${encodeURIComponent(provider.apiKey)}`
+
+  const response = await runSerializedProviderRequest(provider.id, async () => {
+    await waitForProviderCooldown(provider.id)
+
+    const upstream = await fetch(url, {
+      method: "POST",
+      headers: {
+        accept: "application/json",
+        "content-type": "application/json",
+      },
+      body: JSON.stringify(buildGeminiNativeRequest(payload)),
+    })
+
+    if (upstream.status === 429) {
+      const delayMs = getRateLimitDelayMs(upstream)
+      setProviderCooldown(provider.id, delayMs)
+    }
+
+    return upstream
+  })
+
+  if (!response.ok) {
+    consola.error("Failed to create chat completions", response)
+    throw new HTTPError("Failed to create chat completions", response)
+  }
+
+  const parsed = (await response.json()) as unknown
+  const normalized = mapGeminiNativeResponseToChatCompletion(parsed, payload.model)
+
+  if (payload.stream) {
+    return createSyntheticChatCompletionStream(normalized)
+  }
+
+  return normalized
+}
+
 async function createOpenAICompatibleChatCompletions(
   payload: ChatCompletionsPayload,
   provider: ProviderConfig,
 ) {
-  if (!provider.baseUrl || !provider.apiKey) {
-    throw new Error(
-      "Provider mode is enabled but base URL or API key is missing",
-    )
+  if (provider.mode === "openai-compatible") {
+    if (!provider.baseUrl || !provider.apiKey) {
+      throw new Error(
+        "Provider mode is enabled but base URL or API key is missing",
+      )
+    }
+  } else if (provider.mode === "vertex-ai") {
+    if (!provider.baseUrl) {
+      throw new Error(
+        "Vertex AI mode requires a region (stored in base URL) to be configured",
+      )
+    }
+  }
+
+  if (isGeminiAiStudioNativeProvider(provider)) {
+    return await createGeminiNativeChatCompletions(payload, provider)
   }
 
   let workingPayload = payload
   const appliedFallbacks = new Set<string>()
   let rateLimitRetries = 0
+  let totalUpstreamCalls = 0
+
+  const requestHandlingMode =
+    provider.requestHandlingMode || DEFAULT_PROVIDER_REQUEST_HANDLING_MODE
+  const policy =
+    PROVIDER_REQUEST_HANDLING_POLICIES[requestHandlingMode]
+    || PROVIDER_REQUEST_HANDLING_POLICIES[DEFAULT_PROVIDER_REQUEST_HANDLING_MODE]
 
   while (true) {
     const response = await postOpenAICompatibleChatCompletions(
       workingPayload,
       provider,
     )
+    totalUpstreamCalls = totalUpstreamCalls + 1
 
     if (response.ok) {
       if (workingPayload.stream) {
@@ -99,40 +1278,64 @@ async function createOpenAICompatibleChatCompletions(
     if (response.status === 429) {
       const delayMs = getRateLimitDelayMs(response)
       const allowRetry =
-        rateLimitRetries < MAX_RATE_LIMIT_RETRIES
-        && delayMs <= MAX_AUTORETRY_DELAY_MS
+        rateLimitRetries < policy.maxRateLimitRetries
+        && delayMs <= policy.maxAutoRetryDelayMs
+        && totalUpstreamCalls < policy.maxTotalUpstreamCalls
 
       if (allowRetry) {
         rateLimitRetries = rateLimitRetries + 1
         consola.warn(
-          `Provider rate limited request (${provider.id}); retrying ${rateLimitRetries}/${MAX_RATE_LIMIT_RETRIES} after cooldown.`,
+          `Provider rate limited request (${provider.id}); retrying ${rateLimitRetries}/${policy.maxRateLimitRetries} after cooldown (mode=${requestHandlingMode}).`,
         )
         continue
       }
 
       const retryHint =
-        delayMs > MAX_AUTORETRY_DELAY_MS ?
+        delayMs > policy.maxAutoRetryDelayMs ?
           ` retry-after ~${Math.ceil(delayMs / 1000)}s`
         : ""
       consola.warn(
-        `Provider rate limited request (${provider.id}) and auto-retry budget is exhausted.${retryHint}`,
+        `Provider rate limited request (${provider.id}) and auto-retry budget is exhausted (mode=${requestHandlingMode}, attempts=${totalUpstreamCalls}/${policy.maxTotalUpstreamCalls}).${retryHint}`,
       )
-    }
 
-    const fallback = buildCompatibilityFallback(
-      workingPayload,
-      errorText,
-      appliedFallbacks,
-    )
-
-    if (!fallback) {
       consola.error("Failed to create chat completions", response)
       throw new HTTPError("Failed to create chat completions", response)
     }
 
-    consola.warn(`Provider compatibility fallback applied: ${fallback.reason}`)
-    appliedFallbacks.add(fallback.key)
-    workingPayload = fallback.payload
+    const fallback = policy.allowCompatibilityFallback
+      ? buildCompatibilityFallback(
+        workingPayload,
+        errorText,
+        appliedFallbacks,
+      )
+      : undefined
+
+    if (
+      fallback
+      && totalUpstreamCalls < policy.maxTotalUpstreamCalls
+    ) {
+      consola.warn(
+        `Provider compatibility fallback applied: ${fallback.reason} (mode=${requestHandlingMode})`,
+      )
+      appliedFallbacks.add(fallback.key)
+      workingPayload = fallback.payload
+      continue
+    }
+
+    if (fallback && !policy.allowCompatibilityFallback) {
+      consola.warn(
+        `Provider compatibility fallback skipped because mode=${requestHandlingMode}.`,
+      )
+    }
+
+    if (fallback && totalUpstreamCalls >= policy.maxTotalUpstreamCalls) {
+      consola.warn(
+        `Provider compatibility fallback blocked by upstream call budget (${totalUpstreamCalls}/${policy.maxTotalUpstreamCalls}, mode=${requestHandlingMode}).`,
+      )
+    }
+
+    consola.error("Failed to create chat completions", response)
+    throw new HTTPError("Failed to create chat completions", response)
   }
 }
 
@@ -143,12 +1346,29 @@ async function postOpenAICompatibleChatCompletions(
   return await runSerializedProviderRequest(provider.id, async () => {
     await waitForProviderCooldown(provider.id)
 
-    const response = await fetch(`${provider.baseUrl}/chat/completions`, {
+    let url = `${provider.baseUrl}/chat/completions`
+    let authHeader = `Bearer ${provider.apiKey}`
+
+    if (provider.mode === "vertex-ai") {
+      const location = provider.baseUrl || "us-central1"
+      let projectId = provider.apiKey
+      
+      if (!projectId || projectId.trim() === "") {
+        projectId = await vertexAuth.getProjectId()
+      }
+
+      url = `https://${location}-aiplatform.googleapis.com/v1beta1/projects/${projectId}/locations/${location}/endpoints/openapi/chat/completions`
+      
+      const token = await vertexAuth.getAccessToken()
+      authHeader = `Bearer ${token}`
+    }
+
+    const response = await fetch(url, {
       method: "POST",
       headers: {
         accept: "application/json",
         "content-type": "application/json",
-        authorization: `Bearer ${provider.apiKey}`,
+        authorization: authHeader,
         ...provider.headers,
       },
       body: JSON.stringify(payload),
@@ -491,6 +1711,7 @@ function isNonMultimodalModelError(errorText: string): boolean {
     normalized.includes("not a multimodal model")
     || normalized.includes("not multimodal")
     || normalized.includes("does not support image")
+    || normalized.includes("support image input")
   )
 }
 

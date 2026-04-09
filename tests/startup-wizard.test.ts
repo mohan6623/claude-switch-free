@@ -27,6 +27,7 @@ describe("startup wizard helpers", () => {
     expect(opencode?.apiKeyUrl).toContain("opencode")
     expect(openrouter?.baseUrl).toBe("https://openrouter.ai/api/v1")
     expect(gemini?.baseUrl).toContain("googleapis.com")
+    expect(presets.some((p) => p.id === "vertex-ai")).toBe(false)
   })
 
   test("normalizes partial slots from default model", () => {
