@@ -163,7 +163,6 @@ The following command line options are available for the `start` command:
 | --github-token        | Provide GitHub token directly (must be generated using the `auth` subcommand)             | none       | -g    |
 | --claude-code         | Generate a command to launch Claude Code with Copilot API config                          | false      | -c    |
 | --show-token          | Show GitHub and Copilot tokens on fetch and refresh                                       | false      | none  |
-| --proxy-env           | Initialize proxy from environment variables                                               | false      | none  |
 | --provider            | Provider preset override: `copilot`, `opencode`, `openrouter`, `groq`, `xai`, `nvidia-nim`, `gemini`, `custom` (omit to use interactive startup wizard) | none       | none  |
 | --provider-base-url   | Override provider base URL                                                                | none       | none  |
 | --provider-api-key    | Override provider API key                                                                 | none       | none  |
@@ -304,8 +303,6 @@ npx copilot-api@latest debug
 # Display debug information in JSON format
 npx copilot-api@latest debug --json
 
-# Initialize proxy from environment variables (HTTP_PROXY, HTTPS_PROXY, etc.)
-npx copilot-api@latest start --proxy-env
 ```
 
 ### Provider Presets and Environment Variables

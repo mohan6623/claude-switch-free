@@ -6,6 +6,7 @@ const APP_DIR = path.join(os.homedir(), ".local", "share", "copilot-api")
 
 const GITHUB_TOKEN_PATH = path.join(APP_DIR, "github_token")
 const STARTUP_CONFIG_PATH = path.join(APP_DIR, "startup-config.json")
+const ANALYTICS_DIR = path.join(APP_DIR, "analytics")
 
 const DEFAULT_STARTUP_CONFIG = {
   version: 1,
@@ -17,10 +18,12 @@ export const PATHS = {
   APP_DIR,
   GITHUB_TOKEN_PATH,
   STARTUP_CONFIG_PATH,
+  ANALYTICS_DIR,
 }
 
 export async function ensurePaths(): Promise<void> {
   await fs.mkdir(PATHS.APP_DIR, { recursive: true })
+  await fs.mkdir(PATHS.ANALYTICS_DIR, { recursive: true })
   await ensureFile(PATHS.GITHUB_TOKEN_PATH)
   await ensureJsonFile(PATHS.STARTUP_CONFIG_PATH, DEFAULT_STARTUP_CONFIG)
 }

@@ -125,7 +125,7 @@ describe("Anthropic to OpenAI translation logic", () => {
     expect(isValidChatCompletionRequest(openAIPayload)).toBe(false)
   })
 
-  test("should handle thinking blocks in assistant messages", () => {
+  test("should strip thinking blocks in assistant messages", () => {
     const anthropicPayload: AnthropicMessagesPayload = {
       model: "claude-3-5-sonnet-20241022",
       messages: [
@@ -146,17 +146,17 @@ describe("Anthropic to OpenAI translation logic", () => {
     const openAIPayload = translateToOpenAI(anthropicPayload).payload
     expect(isValidChatCompletionRequest(openAIPayload)).toBe(true)
 
-    // Check that thinking content is combined with text content
+    // Thinking blocks must not be forwarded as downstream prompt text.
     const assistantMessage = openAIPayload.messages.find(
       (m) => m.role === "assistant",
     )
-    expect(assistantMessage?.content).toContain(
+    expect(assistantMessage?.content).not.toContain(
       "Let me think about this simple math problem...",
     )
     expect(assistantMessage?.content).toContain("2+2 equals 4.")
   })
 
-  test("should handle thinking blocks with tool calls", () => {
+  test("should strip thinking blocks when assistant emits tool calls", () => {
     const anthropicPayload: AnthropicMessagesPayload = {
       model: "claude-3-5-sonnet-20241022",
       messages: [
@@ -184,11 +184,11 @@ describe("Anthropic to OpenAI translation logic", () => {
     const openAIPayload = translateToOpenAI(anthropicPayload).payload
     expect(isValidChatCompletionRequest(openAIPayload)).toBe(true)
 
-    // Check that thinking content is included in the message content
+    // Thinking blocks must not be included in the assistant content.
     const assistantMessage = openAIPayload.messages.find(
       (m) => m.role === "assistant",
     )
-    expect(assistantMessage?.content).toContain(
+    expect(assistantMessage?.content).not.toContain(
       "I need to call the weather API",
     )
     expect(assistantMessage?.content).toContain(

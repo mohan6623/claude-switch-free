@@ -20,7 +20,6 @@ import {
   type ProviderRequestHandlingMode,
   type ResolveProviderOptions,
 } from "./lib/provider-config"
-import { initProxyFromEnv } from "./lib/proxy"
 import { generateEnvScript } from "./lib/shell"
 import { state } from "./lib/state"
 import {
@@ -51,7 +50,6 @@ import {
   hasCompleteModelSlots,
   normalizeModelSlots,
   summarizeModelSlots,
-  shouldReuseSavedModels,
   type ModelSlots,
 } from "./lib/startup-wizard"
 import { persistSwitchConfig } from "./lib/switch-persistence"
@@ -70,7 +68,6 @@ interface RunServerOptions {
   githubToken?: string
   claudeCode: boolean
   showToken: boolean
-  proxyEnv: boolean
   provider?: string
   providerBaseUrl?: string
   providerApiKey?: string
@@ -209,10 +206,6 @@ function resolveDisplayModelSlotsForProfile(
 }
 
 export async function runServer(options: RunServerOptions): Promise<void> {
-  if (options.proxyEnv) {
-    initProxyFromEnv()
-  }
-
   await ensurePaths()
 
   const startupSelection = await resolveStartupSelection(options)
@@ -339,7 +332,7 @@ export async function runServer(options: RunServerOptions): Promise<void> {
   }
 
   consola.box(
-    `Usage Viewer: https://ericc-ch.github.io/copilot-api?endpoint=${serverUrl}/usage`,
+    `Dashboard: ${serverUrl}/dashboard`,
   )
 
   serve({
@@ -422,7 +415,16 @@ export async function runSwitchConfiguration(): Promise<void> {
 
   if (workingConfig.providers.length === 0) {
     consola.warn("No providers configured yet. Add a provider first in switch mode.")
-    const added = await runAddProviderFlow(workingConfig, syncTarget)
+    let added: StartupSelection
+    try {
+      added = await runAddProviderFlow(workingConfig, syncTarget)
+    } catch (error) {
+      if (error instanceof PromptBackError || error instanceof PromptExitError) {
+        return
+      }
+
+      throw error
+    }
     workingConfig = await loadStartupConfig()
     consola.info(`Initialized with provider ${added.providerOptions.provider || "custom"}`)
   }
@@ -557,69 +559,126 @@ export async function runSwitchConfiguration(): Promise<void> {
     }
 
     if (action === PROVIDER_ACTION_CONTINUE) {
-      await runContinueProviderFlow(
-        workingConfig,
-        syncTarget,
-        sessionSlotSource,
-      )
+      try {
+        await runContinueProviderFlow(
+          workingConfig,
+          syncTarget,
+          sessionSlotSource,
+        )
+      } catch (error) {
+        if (error instanceof PromptBackError) {
+          continue
+        }
+
+        throw error
+      }
       workingConfig = await loadStartupConfig()
       dirty = false
       continue
     }
 
     if (action === PROVIDER_ACTION_ADD) {
-      await runAddProviderFlow(workingConfig, syncTarget)
+      try {
+        await runAddProviderFlow(workingConfig, syncTarget)
+      } catch (error) {
+        if (error instanceof PromptBackError) {
+          continue
+        }
+
+        throw error
+      }
       workingConfig = await loadStartupConfig()
       dirty = false
       continue
     }
 
     if (action === PROVIDER_ACTION_UPDATE) {
-      await runUpdateProviderFlow(
-        workingConfig,
-        syncTarget,
-        undefined,
-        sessionSlotSource,
-      )
+      try {
+        await runUpdateProviderFlow(
+          workingConfig,
+          syncTarget,
+          undefined,
+          sessionSlotSource,
+        )
+      } catch (error) {
+        if (error instanceof PromptBackError) {
+          continue
+        }
+
+        throw error
+      }
       workingConfig = await loadStartupConfig()
       dirty = false
       continue
     }
 
     if (action === PROVIDER_ACTION_SWITCH) {
-      await runSwitchProviderFlow(
-        workingConfig,
-        syncTarget,
-        sessionSlotSource,
-      )
+      try {
+        await runSwitchProviderFlow(
+          workingConfig,
+          syncTarget,
+          sessionSlotSource,
+        )
+      } catch (error) {
+        if (error instanceof PromptBackError) {
+          continue
+        }
+
+        throw error
+      }
       workingConfig = await loadStartupConfig()
       dirty = false
       continue
     }
 
     if (action === PROVIDER_ACTION_DELETE_MODELS) {
-      await runDeleteModelMappingsFlow(
-        workingConfig,
-        syncTarget,
-        sessionSlotSource,
-      )
+      try {
+        await runDeleteModelMappingsFlow(
+          workingConfig,
+          syncTarget,
+          sessionSlotSource,
+        )
+      } catch (error) {
+        if (error instanceof PromptBackError) {
+          continue
+        }
+
+        throw error
+      }
       workingConfig = await loadStartupConfig()
       dirty = false
       continue
     }
 
     if (action === PROVIDER_ACTION_DELETE) {
-      await runDeleteProviderFlow(
-        workingConfig,
-        syncTarget,
-        sessionSlotSource,
-      )
+      try {
+        await runDeleteProviderFlow(
+          workingConfig,
+          syncTarget,
+          sessionSlotSource,
+        )
+      } catch (error) {
+        if (error instanceof PromptBackError) {
+          continue
+        }
+
+        throw error
+      }
       workingConfig = await loadStartupConfig()
       dirty = false
 
       if (workingConfig.providers.length === 0) {
         consola.warn("No providers configured yet. Add a provider first in switch mode.")
-        const added = await runAddProviderFlow(workingConfig, syncTarget)
+        let added: StartupSelection
+        try {
+          added = await runAddProviderFlow(workingConfig, syncTarget)
+        } catch (error) {
+          if (error instanceof PromptBackError) {
+            continue
+          }
+
+          throw error
+        }
         workingConfig = await loadStartupConfig()
         consola.info(
           `Initialized with provider ${added.providerOptions.provider || "custom"}`,
@@ -932,10 +991,24 @@ async function runContinueProviderFlow(
   const modelSlots = resolveDisplayModelSlotsForProfile(active, slotSource)
 
   if (!modelSlots) {
-    consola.warn(
-      `Provider ${active.label} is missing model slots. Updating models now.`,
+    const fallbackSlots = buildDefaultModelSlotsForProvider(active.id)
+    const updatedProfile: ProviderProfile = {
+      ...active,
+      modelSlots: fallbackSlots,
+      updatedAt: new Date().toISOString(),
+    }
+
+    const updatedConfig = setActiveProvider(
+      upsertProviderProfile(withActive, updatedProfile),
+      updatedProfile.id,
     )
-    return await runUpdateProviderFlow(withActive, syncTarget, active.id, slotSource)
+    await persistSwitchConfigWithTarget(updatedConfig, syncTarget)
+
+    consola.warn(
+      `Provider ${active.label} had no model slots. Default mappings were created; use \"Change model mappings\" to customize.`,
+    )
+
+    return buildSelectionFromProfile(updatedProfile, fallbackSlots)
   }
 
   consola.info(`Continuing with ${active.label} (${active.baseUrl})`)
@@ -957,34 +1030,9 @@ async function runAddProviderFlow(
     providerChoice.existingProfile?.requestHandlingMode,
   )
 
-  let modelSlots: ModelSlots
-  let keepExistingModels = false
-
-  if (hasCompleteModelSlots(providerChoice.existingProfile?.modelSlots)) {
-    keepExistingModels = await promptConfirm(
-      "Keep previous model slot configuration for this provider?",
-      true,
-    )
-  }
-
-  if (
-    shouldReuseSavedModels(
-      providerChoice.existingProfile?.modelSlots,
-      keepExistingModels,
-    )
-  ) {
-    modelSlots = normalizeModelSlots(providerChoice.existingProfile.modelSlots)
-  } else {
-    const availableModels = await fetchProviderModels(
-      providerChoice.id,
-      providerChoice.baseUrl,
-      apiKey,
-    )
-    modelSlots = await promptModelSlots(
-      availableModels,
-      providerChoice.existingProfile?.modelSlots,
-    )
-  }
+  const modelSlots = hasCompleteModelSlots(providerChoice.existingProfile?.modelSlots)
+    ? normalizeModelSlots(providerChoice.existingProfile.modelSlots)
+    : buildDefaultModelSlotsForProvider(providerChoice.id)
 
   const updatedProfile: ProviderProfile = {
     id: providerChoice.id,
@@ -1007,7 +1055,8 @@ async function runAddProviderFlow(
   consola.info(
     `Request handling mode: ${formatRequestHandlingModeLabel(requestHandlingMode)}`,
   )
-  consola.info(`Selected models: ${summarizeModelSlots(modelSlots)}`)
+  consola.info("Provider added. Use \"Change model mappings\" when you want to update slot models.")
+  consola.info(`Current model mappings: ${summarizeModelSlots(modelSlots)}`)
   return buildSelectionFromProfile(updatedProfile, modelSlots)
 }
 
@@ -1031,30 +1080,29 @@ async function runUpdateProviderFlow(
 
   const updateOptions = [
     "Update API key",
-    "Update model slots",
     "Update request handling mode",
-    "Update API key and model slots",
-    "Update everything",
+    "Update API key and request handling mode",
+    "Back",
   ]
 
   const updateSelection = await promptSelect(
     "What do you want to update?",
     updateOptions,
-    updateOptions[1],
+    updateOptions[0],
     { spacing: "minor" },
   )
+
+  if (updateSelection === "Back") {
+    throw new PromptBackError()
+  }
 
   const shouldUpdateApiKey =
     updateSelection === "Update API key"
     || updateSelection === "Update API key and model slots"
     || updateSelection === "Update everything"
-  const shouldUpdateModels =
-    updateSelection === "Update model slots"
-    || updateSelection === "Update API key and model slots"
-    || updateSelection === "Update everything"
   const shouldUpdateRequestHandlingMode =
     updateSelection === "Update request handling mode"
-    || updateSelection === "Update everything"
+    || updateSelection === "Update API key and request handling mode"
 
   const apiKey = shouldUpdateApiKey
     ? await promptProviderApiKey({
@@ -1067,17 +1115,9 @@ async function runUpdateProviderFlow(
     })
     : profile.apiKey
 
-  let modelSlots: ModelSlots
-  if (shouldUpdateModels || !hasCompleteModelSlots(profile.modelSlots)) {
-    const availableModels = await fetchProviderModels(
-      profile.id,
-      profile.baseUrl,
-      apiKey,
-    )
-    modelSlots = await promptModelSlots(availableModels, profile.modelSlots)
-  } else {
-    modelSlots = normalizeModelSlots(profile.modelSlots)
-  }
+  const modelSlots = hasCompleteModelSlots(profile.modelSlots)
+    ? normalizeModelSlots(profile.modelSlots)
+    : buildDefaultModelSlotsForProvider(profile.id)
 
   const requestHandlingMode = shouldUpdateRequestHandlingMode
     ? await promptRequestHandlingMode(profile.requestHandlingMode)
@@ -1100,7 +1140,8 @@ async function runUpdateProviderFlow(
   consola.info(
     `Request handling mode: ${formatRequestHandlingModeLabel(requestHandlingMode)}`,
   )
-  consola.info(`Selected models: ${summarizeModelSlots(modelSlots)}`)
+  consola.info("Provider metadata updated. Slot model changes remain in \"Change model mappings\".")
+  consola.info(`Current model mappings: ${summarizeModelSlots(modelSlots)}`)
   return buildSelectionFromProfile(updatedProfile, modelSlots)
 }
 
@@ -1123,12 +1164,7 @@ async function runSwitchProviderFlow(
   if (hasCompleteModelSlots(selectedProfile.modelSlots)) {
     modelSlots = normalizeModelSlots(selectedProfile.modelSlots)
   } else {
-    const availableModels = await fetchProviderModels(
-      selectedProfile.id,
-      selectedProfile.baseUrl,
-      selectedProfile.apiKey,
-    )
-    modelSlots = await promptModelSlots(availableModels, selectedProfile.modelSlots)
+    modelSlots = buildDefaultModelSlotsForProvider(selectedProfile.id)
   }
 
   const refreshedProfile: ProviderProfile = {
@@ -1236,6 +1272,7 @@ async function promptProviderChoiceForAdd(
       searchText: `${preset.id} ${preset.label} ${preset.baseUrl}`,
     })),
     ADD_CUSTOM_PROVIDER_LABEL,
+    "Back",
   ]
 
   const selected = await promptSelect(
@@ -1246,11 +1283,12 @@ async function promptProviderChoiceForAdd(
   )
 
   if (selected === ADD_CUSTOM_PROVIDER_LABEL) {
+    const customProviderName = await promptText("Enter custom provider name")
     const customBaseUrl = stripBaseUrl(
       await promptText("Enter custom provider base URL"),
     )
 
-    const customId = buildCustomProviderId(customBaseUrl)
+    const customId = buildCustomProviderId(customProviderName, customBaseUrl)
     const existingProfile = getProviderProfile(
       { version: 1, providers: existingProfiles },
       customId,
@@ -1258,11 +1296,15 @@ async function promptProviderChoiceForAdd(
 
     return {
       id: customId,
-      label: `Custom (${customId})`,
+      label: customProviderName,
       baseUrl: customBaseUrl,
       isPreset: false,
       existingProfile,
     }
+  }
+
+  if (selected === "Back") {
+    throw new PromptBackError()
   }
 
   const presetValuePrefix = "preset:"
@@ -1320,10 +1362,21 @@ async function promptExistingProviderProfile(
 
   const selectedId = await promptSelect(
     promptMessage,
-    options,
+    [
+      ...options,
+      {
+        value: "__back__",
+        label: "Back",
+        description: "Return to previous menu",
+        searchText: "back return",
+      },
+    ],
     options[0]?.value,
     { spacing: "major" },
   )
+  if (selectedId === "__back__") {
+    throw new PromptBackError()
+  }
   const selectedProfile = profiles.find((profile) => profile.id === selectedId)
   if (!selectedProfile) {
     return undefined
@@ -1423,12 +1476,6 @@ async function promptRequestHandlingMode(
 }
 
 async function promptProviderApiKey(choice: ProviderChoice): Promise<string> {
-  if (choice.id === "vertex-ai") {
-    // For Vertex AI, apiKey field is repurposed to store the optional Project ID.
-    // BaseUrl field is repurposed to store the GCP region.
-    return ""
-  }
-
   const existingApiKey = choice.existingProfile?.apiKey
 
   if (existingApiKey) {
@@ -1572,69 +1619,6 @@ async function fetchGeminiAiStudioModels(
   }
 }
 
-async function promptModelSlots(
-  availableModels: Array<string>,
-  existing?: Partial<ModelSlots>,
-): Promise<ModelSlots> {
-  if (availableModels.length === 0) {
-    consola.warn(
-      "Could not fetch model list from provider. Falling back to manual model entry.",
-    )
-
-    const manualDefault = await promptText(
-      "Enter default model",
-      existing?.defaultModel || FALLBACK_MODEL,
-    )
-    const manualBig = await promptText(
-      "Enter big model (Opus slot)",
-      existing?.bigModel || manualDefault,
-    )
-    const manualSonnet = await promptText(
-      "Enter sonnet model (fast and cheap)",
-      existing?.sonnetModel || manualDefault,
-    )
-    const manualHaiku = await promptText(
-      "Enter haiku model",
-      existing?.haikuModel || manualSonnet,
-    )
-
-    return normalizeModelSlots({
-      defaultModel: manualDefault,
-      bigModel: manualBig,
-      sonnetModel: manualSonnet,
-      haikuModel: manualHaiku,
-    })
-  }
-
-  const defaultModel = await promptModelFromSearch(
-    "default model",
-    availableModels,
-    existing?.defaultModel,
-  )
-  const bigModel = await promptModelFromSearch(
-    "big model (Opus slot)",
-    availableModels,
-    existing?.bigModel || defaultModel,
-  )
-  const sonnetModel = await promptModelFromSearch(
-    "sonnet model (fast and cheap)",
-    availableModels,
-    existing?.sonnetModel || defaultModel,
-  )
-  const haikuModel = await promptModelFromSearch(
-    "haiku model",
-    availableModels,
-    existing?.haikuModel || sonnetModel,
-  )
-
-  return normalizeModelSlots({
-    defaultModel,
-    bigModel,
-    sonnetModel,
-    haikuModel,
-  })
-}
-
 async function promptModelFromSearch(
   slotLabel: string,
   models: Array<string>,
@@ -1710,18 +1694,36 @@ function stripBaseUrl(value: string): string {
   return value.replace(/\/+$/, "")
 }
 
-function buildCustomProviderId(baseUrl: string): string {
+function buildCustomProviderId(label: string, baseUrl: string): string {
+  const namePart = label
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+
   try {
     const parsed = new URL(baseUrl)
     const host = parsed.hostname.replace(/[^a-zA-Z0-9]/g, "-")
-    const pathname = parsed.pathname
-      .replace(/[^a-zA-Z0-9]/g, "-")
-      .replace(/^-+|-+$/g, "")
-    const combined = pathname ? `${host}-${pathname}` : host
+
+    const combined = [namePart, host]
+      .filter((value) => value.length > 0)
+      .join("-")
+
     return `custom-${combined || "provider"}`.toLowerCase()
   } catch {
-    return "custom-provider"
+    return `custom-${namePart || "provider"}`
   }
+}
+
+function buildDefaultModelSlotsForProvider(providerId: string): ModelSlots {
+  const baseModel = providerId === "openrouter" ? "qwen/qwen3.6-plus:free" : FALLBACK_MODEL
+
+  return normalizeModelSlots({
+    defaultModel: baseModel,
+    bigModel: baseModel,
+    sonnetModel: baseModel,
+    haikuModel: baseModel,
+  })
 }
 
 async function promptSelect(
@@ -2015,11 +2017,6 @@ export const start = defineCommand({
       default: false,
       description: "Show GitHub and Copilot tokens on fetch and refresh",
     },
-    "proxy-env": {
-      type: "boolean",
-      default: false,
-      description: "Initialize proxy from environment variables",
-    },
     provider: {
       type: "string",
       description:
@@ -2063,7 +2060,6 @@ export const start = defineCommand({
       githubToken: args["github-token"],
       claudeCode: args["claude-code"],
       showToken: args["show-token"],
-      proxyEnv: args["proxy-env"],
       provider: args.provider,
       providerBaseUrl: args["provider-base-url"],
       providerApiKey: args["provider-api-key"],

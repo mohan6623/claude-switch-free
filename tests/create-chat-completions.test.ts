@@ -254,6 +254,65 @@ describe("createChatCompletions core behavior", () => {
     expect(headers?.["X-Initiator"]).toBe("user")
   })
 
+  test("rejects concurrent requests for the same session id", async () => {
+    state.provider = {
+      id: "opencode",
+      mode: "openai-compatible",
+      baseUrl: "https://opencode.ai/zen/v1",
+      apiKey: "sk-provider",
+    }
+
+    let releaseFirstRequest: (() => void) | undefined
+    const firstRequestGate = new Promise<void>((resolve) => {
+      releaseFirstRequest = resolve
+    })
+
+    const fetchMock = mock((url: string) => {
+      expect(url).toBe("https://opencode.ai/zen/v1/chat/completions")
+      return firstRequestGate.then(() => buildSuccessResponse("kimi_k2"))
+    })
+
+    ;(globalThis as unknown as { fetch: typeof fetch }).fetch =
+      fetchMock as unknown as typeof fetch
+
+    const payload: ChatCompletionsPayload = {
+      model: "kimi_k2",
+      messages: [{ role: "user", content: "hello" }],
+    }
+
+    const firstRequest = createChatCompletions(
+      payload,
+      undefined,
+      { sessionId: "session-123" },
+    )
+
+    const secondRequest = createChatCompletions(
+      payload,
+      undefined,
+      { sessionId: "session-123" },
+    )
+
+    releaseFirstRequest?.()
+
+    let thrown: unknown
+    try {
+      await secondRequest
+    } catch (error) {
+      thrown = error
+    }
+
+    expect(thrown).toBeInstanceOf(HTTPError)
+    if (!(thrown instanceof HTTPError)) {
+      throw new Error(
+        "Expected HTTPError for duplicate in-flight session request",
+      )
+    }
+
+    expect(thrown.response.status).toBe(409)
+    await firstRequest
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+  })
+
   test("retries provider request without images when model is non-multimodal", async () => {
     state.provider = {
       id: "opencode",
@@ -289,6 +348,69 @@ describe("createChatCompletions core behavior", () => {
 
     const payload: ChatCompletionsPayload = {
       model: "kimi_k2",
+      messages: [
+        {
+          role: "user",
+          content: [
+            { type: "text", text: "Describe this" },
+            {
+              type: "image_url",
+              image_url: {
+                url: "data:image/png;base64,ZmFrZS1pbWFnZS1kYXRh",
+              },
+            },
+          ],
+        },
+      ],
+    }
+
+    await createChatCompletions(payload)
+
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    const first = capturedBodies[0]?.messages[0]?.content
+    const second = capturedBodies[1]?.messages[0]?.content
+
+    expect(Array.isArray(first)).toBe(true)
+    expect(Array.isArray(second)).toBe(true)
+
+    if (!Array.isArray(first) || !Array.isArray(second)) {
+      throw new TypeError(
+        "Expected message content arrays in captured payloads",
+      )
+    }
+
+    expect(first.some((part) => part.type === "image_url")).toBe(true)
+    expect(second.some((part) => part.type === "image_url")).toBe(false)
+    expect(second.some((part) => part.type === "text")).toBe(true)
+  })
+
+  test("retries copilot request without images when media type is unsupported", async () => {
+    const capturedBodies: Array<ChatCompletionsPayload> = []
+    let attempt = 0
+    const fetchMock = installFetchMock((url, init) => {
+      expect(url.endsWith("/chat/completions")).toBe(true)
+
+      const body = init.body as string
+      capturedBodies.push(JSON.parse(body) as ChatCompletionsPayload)
+
+      if (attempt === 0) {
+        attempt = attempt + 1
+        return Response.json(
+          {
+            error: {
+              message: "validating image item: image media type not supported",
+              code: "invalid_request_body",
+            },
+          },
+          { status: 400 },
+        )
+      }
+
+      return buildSuccessResponse("minimax/m2.5")
+    })
+
+    const payload: ChatCompletionsPayload = {
+      model: "minimax/m2.5",
       messages: [
         {
           role: "user",
@@ -458,7 +580,7 @@ describe("createChatCompletions core behavior", () => {
     }
 
     expect(firstItem.role).toBe("user")
-    expect(firstItem.content?.[0]?.type).toBe("text")
+    expect(firstItem.content?.[0]?.type).toBe("input_text")
     expect(firstItem.content?.[0]?.text).toBe("hello")
   })
 
@@ -524,7 +646,103 @@ describe("createChatCompletions core behavior", () => {
     expect(assistantItem.content?.[0]?.text).toBe("Previous answer")
   })
 
-  test("retries via /responses when Copilot returns model_not_supported", async () => {
+  test("normalizes oversized function call ids for /responses fallback", async () => {
+    const capturedFallbackBodies: Array<Record<string, unknown>> = []
+
+    const fetchMock = installFetchMock((url, init) => {
+      if (url.endsWith("/chat/completions")) {
+        return buildUnsupportedApiForModelResponse()
+      }
+
+      if (url.endsWith("/responses")) {
+        capturedFallbackBodies.push(
+          JSON.parse(init.body as string) as Record<string, unknown>,
+        )
+
+        return Response.json({
+          id: "resp_callid_1",
+          model: "gpt-5.3-codex",
+          output: [
+            {
+              type: "message",
+              role: "assistant",
+              content: [{ type: "output_text", text: "ok" }],
+            },
+          ],
+          usage: {
+            input_tokens: 12,
+            output_tokens: 1,
+            total_tokens: 13,
+          },
+        })
+      }
+
+      throw new Error(`Unexpected request URL: ${url}`)
+    })
+
+    const oversizedCallId = `call_${"x".repeat(2000)}`
+    const payload: ChatCompletionsPayload = {
+      model: "gpt-5.3-codex",
+      messages: [
+        { role: "user", content: "hello" },
+        {
+          role: "assistant",
+          content: "I will call a tool",
+          tool_calls: [
+            {
+              id: oversizedCallId,
+              type: "function",
+              function: {
+                name: "search_docs",
+                arguments: '{"query":"retry policy"}',
+              },
+            },
+          ],
+        },
+        {
+          role: "tool",
+          tool_call_id: oversizedCallId,
+          content: "tool result",
+        },
+      ],
+    }
+
+    await createChatCompletions(payload)
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+
+    const fallbackInput = capturedFallbackBodies[0]?.input
+    expect(Array.isArray(fallbackInput)).toBe(true)
+    if (!Array.isArray(fallbackInput)) {
+      throw new Error("Expected responses fallback payload input array")
+    }
+
+    const functionCallItem = fallbackInput.find(
+      (item) =>
+        typeof item === "object"
+        && item !== null
+        && (item as { type?: string }).type === "function_call",
+    ) as { call_id?: string } | undefined
+
+    const functionCallOutputItem = fallbackInput.find(
+      (item) =>
+        typeof item === "object"
+        && item !== null
+        && (item as { type?: string }).type === "function_call_output",
+    ) as { call_id?: string } | undefined
+
+    expect(typeof functionCallItem?.call_id).toBe("string")
+    expect(typeof functionCallOutputItem?.call_id).toBe("string")
+
+    if (!functionCallItem?.call_id || !functionCallOutputItem?.call_id) {
+      throw new Error("Expected function_call and function_call_output call ids")
+    }
+
+    expect(functionCallItem.call_id.length).toBeLessThanOrEqual(64)
+    expect(functionCallOutputItem.call_id.length).toBeLessThanOrEqual(64)
+    expect(functionCallItem.call_id).toBe(functionCallOutputItem.call_id)
+  })
+
+  test("does not fallback via /responses when Copilot returns model_not_supported", async () => {
     const fetchMock = installFetchMock((url) => {
       if (url.endsWith("/chat/completions")) {
         return buildModelNotSupportedResponse()
@@ -557,15 +775,15 @@ describe("createChatCompletions core behavior", () => {
       messages: [{ role: "user", content: "hello" }],
     }
 
-    const response = await createChatCompletions(payload)
-
-    expect(fetchMock).toHaveBeenCalledTimes(2)
-    expect(Object.hasOwn(response, "choices")).toBe(true)
-
-    const nonStreaming = response as {
-      choices: Array<{ message: { content: string | null } }>
+    let thrown: unknown
+    try {
+      await createChatCompletions(payload)
+    } catch (error) {
+      thrown = error
     }
-    expect(nonStreaming.choices[0]?.message.content).toBe("fallback worked")
+
+    expect(thrown).toBeInstanceOf(HTTPError)
+    expect(fetchMock).toHaveBeenCalledTimes(1)
   })
 
   test("synthesizes chat-completions stream after /responses fallback", async () => {

@@ -3,6 +3,8 @@ import { cors } from "hono/cors"
 import { logger } from "hono/logger"
 
 import { completionRoutes } from "./routes/chat-completions/route"
+import { dashboardApiRoutes } from "./routes/dashboard/api-route"
+import { dashboardUiRoutes } from "./routes/dashboard/ui-route"
 import { embeddingRoutes } from "./routes/embeddings/route"
 import { messageRoutes } from "./routes/messages/route"
 import { modelRoutes } from "./routes/models/route"
@@ -21,6 +23,9 @@ server.route("/models", modelRoutes)
 server.route("/embeddings", embeddingRoutes)
 server.route("/usage", usageRoute)
 server.route("/token", tokenRoute)
+
+server.route("/dashboard", dashboardUiRoutes)
+server.route("/dashboard/api", dashboardApiRoutes)
 
 // Compatibility with tools that expect v1/ prefix
 server.route("/v1/chat/completions", completionRoutes)

@@ -1,4 +1,4 @@
-export type ProviderMode = "copilot" | "openai-compatible" | "vertex-ai"
+export type ProviderMode = "copilot" | "openai-compatible"
 
 export type ProviderRequestHandlingMode =
   | "strict"
@@ -117,20 +117,6 @@ export function resolveProviderConfig(
       mode: "copilot",
       preferredModel: providerModel,
       preferredSmallModel: providerSmallModel,
-    }
-  }
-
-  if (requestedProvider === "vertex-ai") {
-    return {
-      id: "vertex-ai",
-      mode: "vertex-ai",
-      baseUrl: customBaseUrl, // Use baseUrl to store the GCP region (e.g., us-central1)
-      apiKey: customApiKey,   // Use apiKey to store the explicit GCP project ID, if any
-      preferredModel: providerModel,
-      preferredSmallModel: providerSmallModel,
-      requestHandlingMode: normalizeProviderRequestHandlingMode(
-        providerRequestHandlingMode,
-      ),
     }
   }
 

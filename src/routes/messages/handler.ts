@@ -6,6 +6,7 @@ import { streamSSE } from "hono/streaming"
 import { awaitApproval } from "~/lib/approval"
 import { resolveProviderOverride } from "~/lib/provider-runtime"
 import { checkRateLimit } from "~/lib/rate-limit"
+import { resolveRequestSessionId } from "~/lib/session-id"
 import { state } from "~/lib/state"
 import {
   createChatCompletions,
@@ -48,7 +49,13 @@ export async function handleCompletion(c: Context) {
     await awaitApproval()
   }
 
-  const response = await createChatCompletions(openAIPayload, providerOverride)
+  const sessionId = resolveRequestSessionId(c.req.raw, anthropicPayload)
+
+  const response = await createChatCompletions(
+    openAIPayload,
+    providerOverride,
+    { sessionId },
+  )
 
   if (isNonStreaming(response)) {
     consola.debug(

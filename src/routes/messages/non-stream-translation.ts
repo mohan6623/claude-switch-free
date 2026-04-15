@@ -16,7 +16,6 @@ import {
   type AnthropicMessage,
   type AnthropicMessagesPayload,
   type AnthropicResponse,
-  type AnthropicThinkingBlock,
   type AnthropicTextBlock,
   type AnthropicTool,
   type AnthropicToolResultBlock,
@@ -190,19 +189,10 @@ function handleAssistantMessage(
     (block): block is AnthropicTextBlock => block.type === "text",
   )
 
-  const thinkingBlocks = message.content.filter(
-    (block) => block.type === "thinking",
-  )
-
-  // For GPT models, strip thinking blocks — they have no equivalent format.
-  // For other models, merge thinking into the text content.
-  const allTextContent =
-    isGpt ?
-      textBlocks.map((b) => b.text).join("\n\n")
-    : [
-        ...textBlocks.map((b) => b.text),
-        ...thinkingBlocks.map((b) => (b as { thinking: string }).thinking),
-      ].join("\n\n")
+  // Anthropic thinking blocks are internal reasoning metadata and should not be
+  // forwarded as prompt text to downstream providers. Keeping them inflates
+  // token accounting and can trigger premature context-window exhaustion.
+  const allTextContent = textBlocks.map((b) => b.text).join("\n\n")
 
   if (toolUseBlocks.length > 0) {
     return [
@@ -234,7 +224,7 @@ function mapContent(
   content:
     | string
     | Array<AnthropicUserContentBlock | AnthropicAssistantContentBlock>,
-  isGpt: boolean = false,
+  _isGpt: boolean = false,
 ): string | Array<ContentPart> | null {
   if (typeof content === "string") {
     return content
@@ -243,18 +233,13 @@ function mapContent(
     return null
   }
 
-  // For GPT models, exclude thinking blocks from output
-  const effectiveContent =
-    isGpt ? content.filter((block) => block.type !== "thinking") : content
+  const effectiveContent = content.filter((block) => block.type !== "thinking")
 
   const hasImage = effectiveContent.some((block) => block.type === "image")
   if (!hasImage) {
     return effectiveContent
-      .filter(
-        (block): block is AnthropicTextBlock | AnthropicThinkingBlock =>
-          block.type === "text" || block.type === "thinking",
-      )
-      .map((block) => (block.type === "text" ? block.text : block.thinking))
+      .filter((block): block is AnthropicTextBlock => block.type === "text")
+      .map((block) => block.text)
       .join("\n\n")
   }
 

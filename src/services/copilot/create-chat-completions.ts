@@ -1,5 +1,6 @@
 import consola from "consola"
 import { events } from "fetch-event-stream"
+import { createHash } from "node:crypto"
 
 import {
   DEFAULT_PROVIDER_REQUEST_HANDLING_MODE,
@@ -8,21 +9,22 @@ import {
 } from "~/lib/provider-config"
 
 import { copilotHeaders, copilotBaseUrl } from "~/lib/api-config"
+import {
+  type AnalyticsTokenSource,
+  recordAnalyticsEvent,
+} from "~/lib/analytics-store"
 import { HTTPError } from "~/lib/error"
 import { state } from "~/lib/state"
 import { sleep } from "~/lib/utils"
 
-import { GoogleAuth } from "google-auth-library"
-
 const providerQueueById = new Map<string, Promise<void>>()
 const providerCooldownUntilById = new Map<string, number>()
-const vertexAuth = new GoogleAuth({
-  scopes: ["https://www.googleapis.com/auth/cloud-platform"],
-})
+const activeSessionRequestIds = new Set<string>()
 
 const DEFAULT_RATE_LIMIT_COOLDOWN_MS = 1_500
 const BALANCED_MAX_RATE_LIMIT_RETRIES = 2
 const BALANCED_MAX_AUTORETRY_DELAY_MS = 12_000
+const SESSION_REQUEST_CONFLICT_STATUS = 409
 
 interface ProviderRequestHandlingPolicy {
   maxRateLimitRetries: number
@@ -55,69 +57,226 @@ const PROVIDER_REQUEST_HANDLING_POLICIES: Record<
   },
 }
 
+export interface ChatCompletionsRequestContext {
+  sessionId?: string
+}
+
 export const createChatCompletions = async (
   payload: ChatCompletionsPayload,
   providerOverride?: ProviderConfig,
+  requestContext?: ChatCompletionsRequestContext,
 ) => {
-  const effectiveProvider = providerOverride || state.provider
+  const normalizedSessionId = normalizeInFlightSessionId(
+    requestContext?.sessionId,
+  )
 
-  if (effectiveProvider.mode === "openai-compatible" || effectiveProvider.mode === "vertex-ai") {
-    return await createOpenAICompatibleChatCompletions(
+  if (!normalizedSessionId) {
+    return await createChatCompletionsInternal(payload, providerOverride)
+  }
+
+  if (activeSessionRequestIds.has(normalizedSessionId)) {
+    throw createSessionRequestConflictError()
+  }
+
+  activeSessionRequestIds.add(normalizedSessionId)
+
+  try {
+    return await createChatCompletionsInternal(payload, providerOverride)
+  } finally {
+    activeSessionRequestIds.delete(normalizedSessionId)
+  }
+}
+
+async function createChatCompletionsInternal(
+  payload: ChatCompletionsPayload,
+  providerOverride?: ProviderConfig,
+) {
+  const effectiveProvider = providerOverride || state.provider
+  const route = payload.model.startsWith("cpapi-route:") ? "v1/messages" : "chat/completions"
+  const startTime = Date.now()
+
+  const writeEvent = async (input: {
+    statusCode: number
+    latencyMs: number
+    promptTokens?: number
+    completionTokens?: number
+    totalTokens?: number
+    tokenSource: AnalyticsTokenSource
+  }) => {
+    try {
+      await recordAnalyticsEvent({
+        route,
+        providerId: effectiveProvider.id,
+        model: payload.model,
+        statusCode: input.statusCode,
+        latencyMs: input.latencyMs,
+        stream: Boolean(payload.stream),
+        promptTokens: input.promptTokens,
+        completionTokens: input.completionTokens,
+        totalTokens: input.totalTokens,
+        tokenSource: input.tokenSource,
+      })
+    } catch {
+      // best-effort analytics logging; never block request flow
+    }
+  }
+
+  if (effectiveProvider.mode === "openai-compatible") {
+    const response = await createOpenAICompatibleChatCompletions(
       payload,
       effectiveProvider,
     )
+
+    if (isChatCompletionResponse(response)) {
+      const usage = response.usage
+      await writeEvent({
+        statusCode: 200,
+        latencyMs: Date.now() - startTime,
+        promptTokens: usage?.prompt_tokens,
+        completionTokens: usage?.completion_tokens,
+        totalTokens: usage?.total_tokens,
+        tokenSource: usage ? "api_usage" : "unknown",
+      })
+    } else {
+      await writeEvent({
+        statusCode: 200,
+        latencyMs: Date.now() - startTime,
+        tokenSource: "unknown",
+      })
+    }
+
+    return response
   }
 
   if (!state.copilotToken) throw new Error("Copilot token not found")
-
-  const enableVision = payload.messages.some(
-    (x) =>
-      typeof x.content !== "string"
-      && x.content?.some((x) => x.type === "image_url"),
-  )
 
   // Agent/user check for X-Initiator header
   // Determine if any message is from an agent ("assistant" or "tool")
   const isAgentCall = payload.messages.some((msg) =>
     ["assistant", "tool"].includes(msg.role),
   )
+  let workingPayload = payload
+  const appliedFallbacks = new Set<string>()
 
-  // Build headers and add X-Initiator
-  const headers: Record<string, string> = {
-    ...copilotHeaders(state, enableVision),
-    "X-Initiator": isAgentCall ? "agent" : "user",
-  }
+  while (true) {
+    const enableVision = payloadHasImages(workingPayload)
 
-  const response = await fetch(`${copilotBaseUrl(state)}/chat/completions`, {
-    method: "POST",
-    headers,
-    body: JSON.stringify(payload),
-  })
-
-  if (!response.ok) {
-    const errorText = await response.clone().text()
-
-    if (shouldRetryCopilotViaResponses(response.status, errorText)) {
-      consola.warn(
-        `Copilot model ${payload.model} is not available via /chat/completions. Retrying with /responses compatibility fallback.`,
-      )
-
-      return await createCopilotResponsesFallback(payload, headers)
+    // Build headers and add X-Initiator
+    const headers: Record<string, string> = {
+      ...copilotHeaders(state, enableVision),
+      "X-Initiator": isAgentCall ? "agent" : "user",
     }
 
-    consola.error("Failed to create chat completions", response)
-    throw new HTTPError("Failed to create chat completions", response)
+    const response = await fetch(`${copilotBaseUrl(state)}/chat/completions`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(workingPayload),
+    })
+
+    if (!response.ok) {
+      const errorText = await response.clone().text()
+
+      if (shouldRetryCopilotViaResponses(response.status, errorText)) {
+        consola.warn(
+          `Copilot model ${workingPayload.model} is not available via /chat/completions. Retrying with /responses compatibility fallback.`,
+        )
+
+        const fallback = await createCopilotResponsesFallback(workingPayload, headers)
+        if (isChatCompletionResponse(fallback)) {
+          const usage = fallback.usage
+          await writeEvent({
+            statusCode: 200,
+            latencyMs: Date.now() - startTime,
+            promptTokens: usage?.prompt_tokens,
+            completionTokens: usage?.completion_tokens,
+            totalTokens: usage?.total_tokens,
+            tokenSource: usage ? "api_usage" : "unknown",
+          })
+        } else {
+          await writeEvent({
+            statusCode: 200,
+            latencyMs: Date.now() - startTime,
+            tokenSource: "unknown",
+          })
+        }
+
+        return fallback
+      }
+
+      const compatibilityFallback = buildCompatibilityFallback(
+        workingPayload,
+        errorText,
+        appliedFallbacks,
+      )
+      if (compatibilityFallback) {
+        consola.warn(
+          `Copilot compatibility fallback applied: ${compatibilityFallback.reason}`,
+        )
+        appliedFallbacks.add(compatibilityFallback.key)
+        workingPayload = compatibilityFallback.payload
+        continue
+      }
+
+      await writeEvent({
+        statusCode: response.status,
+        latencyMs: Date.now() - startTime,
+        tokenSource: "unknown",
+      })
+
+      consola.error("Failed to create chat completions", response)
+      throw new HTTPError("Failed to create chat completions", response)
+    }
+
+    if (workingPayload.stream) {
+      await writeEvent({
+        statusCode: 200,
+        latencyMs: Date.now() - startTime,
+        tokenSource: "unknown",
+      })
+      return events(response)
+    }
+
+    const parsed = (await response.json()) as ChatCompletionResponse
+    await writeEvent({
+      statusCode: 200,
+      latencyMs: Date.now() - startTime,
+      promptTokens: parsed.usage?.prompt_tokens,
+      completionTokens: parsed.usage?.completion_tokens,
+      totalTokens: parsed.usage?.total_tokens,
+      tokenSource: parsed.usage ? "api_usage" : "unknown",
+    })
+
+    return parsed
+  }
+}
+
+function createSessionRequestConflictError(): HTTPError {
+  return new HTTPError(
+    "Another request is already in progress for this session",
+    Response.json(
+      {
+        error: {
+          message: "Another request is already in progress for this session.",
+          type: "conflict",
+          code: "session_busy",
+        },
+      },
+      { status: SESSION_REQUEST_CONFLICT_STATUS },
+    ),
+  )
+}
+
+function normalizeInFlightSessionId(value: string | undefined): string | undefined {
+  if (!value) {
+    return undefined
   }
 
-  if (payload.stream) {
-    return events(response)
-  }
-
-  return (await response.json()) as ChatCompletionResponse
+  const trimmed = value.trim()
+  return trimmed || undefined
 }
 
 interface CopilotResponsesTextInputPart {
-  type: "text"
+  type: "input_text"
   text: string
 }
 
@@ -172,10 +331,16 @@ interface CopilotResponsesRequest {
   tool_choice?: "none" | "auto" | "required" | { type: "function"; name: string }
 }
 
+const COPILOT_RESPONSES_MAX_CALL_ID_LENGTH = 64
+const COPILOT_RESPONSES_HASHED_CALL_ID_PREFIX = "cpid_"
+const COPILOT_RESPONSES_HASHED_CALL_ID_HEX_LENGTH =
+  COPILOT_RESPONSES_MAX_CALL_ID_LENGTH
+  - COPILOT_RESPONSES_HASHED_CALL_ID_PREFIX.length
+
 async function createCopilotResponsesFallback(
   payload: ChatCompletionsPayload,
   headers: Record<string, string>,
-): Promise<ChatCompletionResponse | AsyncIterable<{ data: string }>> {
+): Promise<ChatCompletionResponse | AsyncIterable<{ data?: string }>> {
   const response = await fetch(`${copilotBaseUrl(state)}/responses`, {
     method: "POST",
     headers,
@@ -240,9 +405,10 @@ function mapMessagesToResponsesInput(
 
   for (const message of messages) {
     if (message.role === "tool") {
+      const rawCallId = message.tool_call_id || message.name || "tool-output"
       input.push({
         type: "function_call_output",
-        call_id: message.tool_call_id || message.name || "tool-output",
+        call_id: normalizeResponsesCallId(rawCallId),
         output: flattenMessageContentToText(message.content),
       })
       continue
@@ -266,7 +432,7 @@ function mapMessagesToResponsesInput(
             text: "",
           }
         : {
-            type: "text",
+            type: "input_text",
             text: "",
           }
 
@@ -283,7 +449,7 @@ function mapMessagesToResponsesInput(
       for (const toolCall of message.tool_calls) {
         input.push({
           type: "function_call",
-          call_id: toolCall.id,
+          call_id: normalizeResponsesCallId(toolCall.id),
           name: toolCall.function.name,
           arguments: toolCall.function.arguments,
         })
@@ -292,6 +458,15 @@ function mapMessagesToResponsesInput(
   }
 
   return input
+}
+
+function normalizeResponsesCallId(callId: string): string {
+  if (callId.length <= COPILOT_RESPONSES_MAX_CALL_ID_LENGTH) {
+    return callId
+  }
+
+  const digest = createHash("sha256").update(callId).digest("hex")
+  return `${COPILOT_RESPONSES_HASHED_CALL_ID_PREFIX}${digest.slice(0, COPILOT_RESPONSES_HASHED_CALL_ID_HEX_LENGTH)}`
 }
 
 function mapMessageContentToResponsesInput(
@@ -316,7 +491,7 @@ function mapMessageContentToResponsesInput(
   }
 
   if (typeof content === "string") {
-    return [{ type: "text", text: content }]
+    return [{ type: "input_text", text: content }]
   }
 
   if (!Array.isArray(content)) {
@@ -328,7 +503,7 @@ function mapMessageContentToResponsesInput(
   for (const part of content) {
     if (part.type === "text") {
       mapped.push({
-        type: "text",
+        type: "input_text",
         text: part.text,
       })
       continue
@@ -562,14 +737,6 @@ function shouldRetryCopilotViaResponses(
   }
 
   const normalized = errorText.toLowerCase()
-
-  if (normalized.includes("model_not_supported")) {
-    return true
-  }
-
-  if (normalized.includes("requested model is not supported")) {
-    return true
-  }
 
   return (
     normalized.includes("unsupported_api_for_model")
@@ -1179,7 +1346,7 @@ function mapGeminiNativeResponseToChatCompletion(
 async function createGeminiNativeChatCompletions(
   payload: ChatCompletionsPayload,
   provider: ProviderConfig,
-): Promise<ChatCompletionResponse | AsyncIterable<{ data: string }>> {
+): Promise<ChatCompletionResponse | AsyncIterable<{ data?: string }>> {
   if (!provider.baseUrl || !provider.apiKey) {
     throw new Error(
       "Gemini provider requires base URL and API key",
@@ -1229,18 +1396,10 @@ async function createOpenAICompatibleChatCompletions(
   payload: ChatCompletionsPayload,
   provider: ProviderConfig,
 ) {
-  if (provider.mode === "openai-compatible") {
-    if (!provider.baseUrl || !provider.apiKey) {
-      throw new Error(
-        "Provider mode is enabled but base URL or API key is missing",
-      )
-    }
-  } else if (provider.mode === "vertex-ai") {
-    if (!provider.baseUrl) {
-      throw new Error(
-        "Vertex AI mode requires a region (stored in base URL) to be configured",
-      )
-    }
+  if (!provider.baseUrl || !provider.apiKey) {
+    throw new Error(
+      "Provider mode is enabled but base URL or API key is missing",
+    )
   }
 
   if (isGeminiAiStudioNativeProvider(provider)) {
@@ -1346,29 +1505,12 @@ async function postOpenAICompatibleChatCompletions(
   return await runSerializedProviderRequest(provider.id, async () => {
     await waitForProviderCooldown(provider.id)
 
-    let url = `${provider.baseUrl}/chat/completions`
-    let authHeader = `Bearer ${provider.apiKey}`
-
-    if (provider.mode === "vertex-ai") {
-      const location = provider.baseUrl || "us-central1"
-      let projectId = provider.apiKey
-      
-      if (!projectId || projectId.trim() === "") {
-        projectId = await vertexAuth.getProjectId()
-      }
-
-      url = `https://${location}-aiplatform.googleapis.com/v1beta1/projects/${projectId}/locations/${location}/endpoints/openapi/chat/completions`
-      
-      const token = await vertexAuth.getAccessToken()
-      authHeader = `Bearer ${token}`
-    }
-
-    const response = await fetch(url, {
+    const response = await fetch(`${provider.baseUrl}/chat/completions`, {
       method: "POST",
       headers: {
         accept: "application/json",
         "content-type": "application/json",
-        authorization: authHeader,
+        authorization: `Bearer ${provider.apiKey}`,
         ...provider.headers,
       },
       body: JSON.stringify(payload),
@@ -1712,6 +1854,8 @@ function isNonMultimodalModelError(errorText: string): boolean {
     || normalized.includes("not multimodal")
     || normalized.includes("does not support image")
     || normalized.includes("support image input")
+    || normalized.includes("image media type not supported")
+    || normalized.includes("validating image item")
   )
 }
 
@@ -1789,6 +1933,12 @@ interface ChoiceNonStreaming {
   message: ResponseMessage
   logprobs: object | null
   finish_reason: "stop" | "length" | "tool_calls" | "content_filter"
+}
+
+function isChatCompletionResponse(
+  response: ChatCompletionResponse | AsyncIterable<{ data?: string }>,
+): response is ChatCompletionResponse {
+  return Object.hasOwn(response, "choices")
 }
 
 // Payload types
