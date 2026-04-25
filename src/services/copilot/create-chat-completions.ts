@@ -19,12 +19,10 @@ import { sleep } from "~/lib/utils"
 
 const providerQueueById = new Map<string, Promise<void>>()
 const providerCooldownUntilById = new Map<string, number>()
-const activeSessionRequestIds = new Set<string>()
 
 const DEFAULT_RATE_LIMIT_COOLDOWN_MS = 1_500
 const BALANCED_MAX_RATE_LIMIT_RETRIES = 2
 const BALANCED_MAX_AUTORETRY_DELAY_MS = 12_000
-const SESSION_REQUEST_CONFLICT_STATUS = 409
 
 interface ProviderRequestHandlingPolicy {
   maxRateLimitRetries: number
@@ -64,28 +62,8 @@ export interface ChatCompletionsRequestContext {
 export const createChatCompletions = async (
   payload: ChatCompletionsPayload,
   providerOverride?: ProviderConfig,
-  requestContext?: ChatCompletionsRequestContext,
-) => {
-  const normalizedSessionId = normalizeInFlightSessionId(
-    requestContext?.sessionId,
-  )
-
-  if (!normalizedSessionId) {
-    return await createChatCompletionsInternal(payload, providerOverride)
-  }
-
-  if (activeSessionRequestIds.has(normalizedSessionId)) {
-    throw createSessionRequestConflictError()
-  }
-
-  activeSessionRequestIds.add(normalizedSessionId)
-
-  try {
-    return await createChatCompletionsInternal(payload, providerOverride)
-  } finally {
-    activeSessionRequestIds.delete(normalizedSessionId)
-  }
-}
+  _requestContext?: ChatCompletionsRequestContext,
+) => await createChatCompletionsInternal(payload, providerOverride)
 
 async function createChatCompletionsInternal(
   payload: ChatCompletionsPayload,
@@ -261,31 +239,6 @@ async function createChatCompletionsInternal(
 
     return parsed
   }
-}
-
-function createSessionRequestConflictError(): HTTPError {
-  return new HTTPError(
-    "Another request is already in progress for this session",
-    Response.json(
-      {
-        error: {
-          message: "Another request is already in progress for this session.",
-          type: "conflict",
-          code: "session_busy",
-        },
-      },
-      { status: SESSION_REQUEST_CONFLICT_STATUS },
-    ),
-  )
-}
-
-function normalizeInFlightSessionId(value: string | undefined): string | undefined {
-  if (!value) {
-    return undefined
-  }
-
-  const trimmed = value.trim()
-  return trimmed || undefined
 }
 
 interface CopilotResponsesTextInputPart {

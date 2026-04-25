@@ -254,7 +254,7 @@ describe("createChatCompletions core behavior", () => {
     expect(headers?.["X-Initiator"]).toBe("user")
   })
 
-  test("rejects concurrent requests for the same session id", async () => {
+  test("allows concurrent requests for the same session id", async () => {
     state.provider = {
       id: "opencode",
       mode: "openai-compatible",
@@ -294,23 +294,14 @@ describe("createChatCompletions core behavior", () => {
 
     releaseFirstRequest?.()
 
-    let thrown: unknown
-    try {
-      await secondRequest
-    } catch (error) {
-      thrown = error
-    }
+    const [firstResponse, secondResponse] = await Promise.all([
+      firstRequest,
+      secondRequest,
+    ])
 
-    expect(thrown).toBeInstanceOf(HTTPError)
-    if (!(thrown instanceof HTTPError)) {
-      throw new Error(
-        "Expected HTTPError for duplicate in-flight session request",
-      )
-    }
-
-    expect(thrown.response.status).toBe(409)
-    await firstRequest
-    expect(fetchMock).toHaveBeenCalledTimes(1)
+    expect(Object.hasOwn(firstResponse, "choices")).toBe(true)
+    expect(Object.hasOwn(secondResponse, "choices")).toBe(true)
+    expect(fetchMock).toHaveBeenCalledTimes(2)
   })
 
   test("retries provider request without images when model is non-multimodal", async () => {
