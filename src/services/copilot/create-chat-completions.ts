@@ -95,6 +95,15 @@ async function createChatCompletionsInternal(
   const route = payload.model.startsWith("cpapi-route:") ? "v1/messages" : "chat/completions"
   const startTime = Date.now()
 
+  // Log the full request details for debugging
+  const providerBaseUrl = effectiveProvider.mode === "openai-compatible"
+    ? effectiveProvider.baseUrl
+    : copilotBaseUrl(state)
+  consola.info(`[PROXY REQUEST] Provider: ${effectiveProvider.id} (mode: ${effectiveProvider.mode})`)
+  consola.info(`[PROXY REQUEST] Base URL: ${providerBaseUrl}`)
+  consola.info(`[PROXY REQUEST] Model: ${payload.model}`)
+  consola.info(`[PROXY REQUEST] Endpoint: ${effectiveProvider.mode === "openai-compatible" ? "/chat/completions" : copilotBaseUrl(state) + "/chat/completions"}`)
+
   const writeEvent = async (input: {
     statusCode: number
     latencyMs: number
@@ -167,7 +176,11 @@ async function createChatCompletionsInternal(
       "X-Initiator": isAgentCall ? "agent" : "user",
     }
 
-    const response = await fetch(`${copilotBaseUrl(state)}/chat/completions`, {
+    const copilotUrl = `${copilotBaseUrl(state)}/chat/completions`
+    consola.info(`[COPILOT API CALL] Full URL: ${copilotUrl}`)
+    consola.info(`[COPILOT API CALL] Model sent: ${workingPayload.model}`)
+
+    const response = await fetch(copilotUrl, {
       method: "POST",
       headers,
       body: JSON.stringify(workingPayload),
@@ -341,7 +354,11 @@ async function createCopilotResponsesFallback(
   payload: ChatCompletionsPayload,
   headers: Record<string, string>,
 ): Promise<ChatCompletionResponse | AsyncIterable<{ data?: string }>> {
-  const response = await fetch(`${copilotBaseUrl(state)}/responses`, {
+  const responsesUrl = `${copilotBaseUrl(state)}/responses`
+  consola.info(`[RESPONSES FALLBACK] Full URL: ${responsesUrl}`)
+  consola.info(`[RESPONSES FALLBACK] Model sent: ${payload.model}`)
+
+  const response = await fetch(responsesUrl, {
     method: "POST",
     headers,
     body: JSON.stringify(buildCopilotResponsesPayload(payload)),
@@ -1505,7 +1522,12 @@ async function postOpenAICompatibleChatCompletions(
   return await runSerializedProviderRequest(provider.id, async () => {
     await waitForProviderCooldown(provider.id)
 
-    const response = await fetch(`${provider.baseUrl}/chat/completions`, {
+    const fullUrl = `${provider.baseUrl}/chat/completions`
+    consola.info(`[OPENAI_COMPATIBLE API CALL] Provider: ${provider.id}`)
+    consola.info(`[OPENAI_COMPATIBLE API CALL] Full URL: ${fullUrl}`)
+    consola.info(`[OPENAI_COMPATIBLE API CALL] Model sent: ${payload.model}`)
+
+    const response = await fetch(fullUrl, {
       method: "POST",
       headers: {
         accept: "application/json",

@@ -6,9 +6,155 @@ import { normalizeModelSlots, type ModelSlots } from "./startup-wizard"
 
 export type ClaudeSettingsSyncTarget = "local" | "global"
 
+export const MANAGED_CLAUDE_ENV_KEYS = [
+  "ANTHROPIC_BASE_URL",
+  "ANTHROPIC_AUTH_TOKEN",
+  "ANTHROPIC_MODEL",
+  "ANTHROPIC_DEFAULT_SONNET_MODEL",
+  "ANTHROPIC_DEFAULT_OPUS_MODEL",
+  "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+  "ANTHROPIC_SMALL_FAST_MODEL",
+  "DISABLE_NON_ESSENTIAL_MODEL_CALLS",
+  "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
+] as const
+
+const MANAGED_CLAUDE_ENV_KEY_SET = new Set<string>(MANAGED_CLAUDE_ENV_KEYS)
+
 export interface ClaudeSettingsJson {
   env: Record<string, string>
   [key: string]: unknown
+}
+
+export type ClaudeSettingsInspection =
+  | { status: "missing"; path: string }
+  | { status: "invalid-json"; path: string }
+  | { status: "loaded"; path: string; hasUnrelatedSettings: boolean }
+
+export function resolveDefaultClaudeSettingsLocalPath(
+  startDir: string,
+): string {
+  return path.join(path.resolve(startDir), ".claude", "settings.json")
+}
+
+export function hasUnrelatedClaudeSettings(input: unknown): boolean {
+  if (!input || typeof input !== "object" || Array.isArray(input)) {
+    return false
+  }
+
+  const source = input as Record<string, unknown>
+
+  if (Object.keys(source).some((key) => key !== "env")) {
+    return true
+  }
+
+  if (
+    !source.env
+    || typeof source.env !== "object"
+    || Array.isArray(source.env)
+  ) {
+    return false
+  }
+
+  return Object.keys(source.env as Record<string, unknown>).some(
+    (key) => !MANAGED_CLAUDE_ENV_KEY_SET.has(key),
+  )
+}
+
+export async function inspectClaudeSettingsLocal(
+  startDir: string,
+): Promise<ClaudeSettingsInspection> {
+  const baseDir = path.resolve(startDir)
+  const localSettingsPath = path.join(baseDir, ".claude", "settings.local.json")
+  const defaultSettingsPath = resolveDefaultClaudeSettingsLocalPath(baseDir)
+
+  const settingsPath = await (async () => {
+    if (await isReadableWritable(localSettingsPath)) {
+      return localSettingsPath
+    }
+    if (await isReadableWritable(defaultSettingsPath)) {
+      return defaultSettingsPath
+    }
+    return defaultSettingsPath
+  })()
+
+  try {
+    const raw = await fs.readFile(settingsPath, "utf8")
+    if (!raw.trim()) {
+      return {
+        status: "loaded",
+        path: settingsPath,
+        hasUnrelatedSettings: false,
+      }
+    }
+
+    const parsed = JSON.parse(raw) as unknown
+    return {
+      status: "loaded",
+      path: settingsPath,
+      hasUnrelatedSettings: hasUnrelatedClaudeSettings(parsed),
+    }
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code
+    if (code === "ENOENT") {
+      return {
+        status: "missing",
+        path: settingsPath,
+      }
+    }
+
+    return {
+      status: "invalid-json",
+      path: settingsPath,
+    }
+  }
+}
+export function shouldPromptBeforeSync(
+  inspection: ClaudeSettingsInspection,
+): boolean {
+  return (
+    inspection.status === "invalid-json"
+    || (inspection.status === "loaded" && inspection.hasUnrelatedSettings)
+  )
+}
+
+export function buildClaudeSettingsPromptMessage(
+  inspection: ClaudeSettingsInspection,
+): string {
+  if (inspection.status === "invalid-json") {
+    return `Existing Claude settings is invalid JSON at ${inspection.path}. Overwrite with proxy Claude env settings?`
+  }
+
+  return `Found existing unrelated Claude settings at ${inspection.path}. Merge proxy Claude env settings while preserving existing settings?`
+}
+
+export function buildClaudeSettingsSkipMessage(
+  inspection: ClaudeSettingsInspection,
+): string {
+  if (inspection.status === "invalid-json") {
+    return "Skipped Claude settings overwrite because existing settings JSON is invalid and overwrite was declined."
+  }
+
+  return "Skipped Claude settings merge because user chose not to modify existing unrelated settings."
+}
+
+export function buildClaudeSettingsDefaultPromptValue(
+  inspection: ClaudeSettingsInspection,
+): boolean {
+  return inspection.status !== "invalid-json"
+}
+
+export function buildClaudeSettingsMissingInfo(
+  inspection: ClaudeSettingsInspection,
+): string {
+  return `No existing local Claude settings found. A new settings file will be created at ${inspection.path}.`
+}
+
+export function buildClaudeSettingsSuccessMessage(path: string): string {
+  return `Synced Claude settings: ${path}`
+}
+
+export function buildManagedClaudeEnvKeysLabel(): string {
+  return MANAGED_CLAUDE_ENV_KEYS.join(", ")
 }
 
 export interface LoadedClaudeModelSlots {
@@ -20,12 +166,12 @@ export function mergeClaudeSettingsJson(
   input: unknown,
   envPatch: Record<string, string>,
 ): ClaudeSettingsJson {
-  const source = input && typeof input === "object"
-    ? (input as Record<string, unknown>)
-    : {}
+  const source =
+    input && typeof input === "object" ? (input as Record<string, unknown>) : {}
 
-  const existingEnv = source.env && typeof source.env === "object"
-    ? (source.env as Record<string, unknown>)
+  const existingEnv =
+    source.env && typeof source.env === "object" ?
+      (source.env as Record<string, unknown>)
     : {}
 
   const mergedEnv: Record<string, string> = {}
@@ -68,8 +214,9 @@ export async function loadClaudeModelSlotsForTarget(
   startDir: string,
   options: { homeDir?: string } = {},
 ): Promise<LoadedClaudeModelSlots | undefined> {
-  const candidates = syncTarget === "global"
-    ? resolveClaudeSettingsGlobalCandidatePaths(options.homeDir)
+  const candidates =
+    syncTarget === "global" ?
+      resolveClaudeSettingsGlobalCandidatePaths(options.homeDir)
     : resolveClaudeSettingsLocalCandidatePaths(startDir)
 
   for (const candidate of candidates) {
@@ -106,17 +253,18 @@ export async function syncClaudeSettingsGlobal(
   return await syncClaudeSettingsPath(settingsPath, envPatch)
 }
 
-async function syncClaudeSettingsPath(
+export async function syncClaudeSettingsPath(
   settingsPath: string,
   envPatch: Record<string, string>,
 ): Promise<{ updated: boolean; path?: string }> {
-  let parsed: unknown = {}
-  try {
-    const raw = await fs.readFile(settingsPath, "utf8")
-    parsed = raw.trim().length > 0 ? JSON.parse(raw) : {}
-  } catch {
-    parsed = {}
-  }
+  const parsed = await (async (): Promise<unknown> => {
+    try {
+      const raw = await fs.readFile(settingsPath, "utf8")
+      return raw.trim().length > 0 ? JSON.parse(raw) : {}
+    } catch {
+      return {}
+    }
+  })()
 
   const merged = mergeClaudeSettingsJson(parsed, envPatch)
   await fs.writeFile(settingsPath, JSON.stringify(merged, null, 2), "utf8")
@@ -127,13 +275,17 @@ async function syncClaudeSettingsPath(
   }
 }
 
-function resolveClaudeSettingsLocalCandidatePaths(startDir: string): Array<string> {
+function resolveClaudeSettingsLocalCandidatePaths(
+  startDir: string,
+): Array<string> {
   const candidates: Array<string> = []
   let current = path.resolve(startDir)
 
   while (true) {
-    candidates.push(path.join(current, ".claude", "settings.local.json"))
-    candidates.push(path.join(current, ".claude", "settings.json"))
+    candidates.push(
+      path.join(current, ".claude", "settings.local.json"),
+      path.join(current, ".claude", "settings.json"),
+    )
 
     const parent = path.dirname(current)
     if (parent === current) {
@@ -146,7 +298,9 @@ function resolveClaudeSettingsLocalCandidatePaths(startDir: string): Array<strin
   return candidates
 }
 
-function resolveClaudeSettingsGlobalCandidatePaths(homeDir?: string): Array<string> {
+function resolveClaudeSettingsGlobalCandidatePaths(
+  homeDir?: string,
+): Array<string> {
   const home = homeDir || os.homedir()
   return [
     path.join(home, ".claude", "settings.json"),

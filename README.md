@@ -398,9 +398,17 @@ npx copilot-api@latest start --claude-code
 npx copilot-api@latest start --provider opencode --provider-api-key YOUR_OPENCODE_KEY --claude-code
 ```
 
-You will be prompted to select a primary model and a "small, fast" model for background tasks. After selecting the models, a command will be copied to your clipboard. This command sets the necessary environment variables for Claude Code to use the proxy.
+You will be prompted to select a primary model and a "small, fast" model for background tasks.
+
+After selection, the CLI now also syncs local Claude settings in your current workspace:
+- If `.claude/settings.json` is missing, it creates it with the required proxy `env` keys.
+- If the file exists and has unrelated user settings, it asks before merging.
+- If existing JSON is invalid, it asks before overwriting.
+
+The launch command is still copied to clipboard as a fallback/compatibility path.
 
 Paste and run this command in a new terminal to launch Claude Code.
+If you approved settings sync, future runs in the same workspace should already have the required `ANTHROPIC_*` values.
 
 ### Manual Configuration with `settings.json`
 

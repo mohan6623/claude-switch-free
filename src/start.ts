@@ -7,13 +7,18 @@ import consola from "consola"
 import { serve, type ServerHandler } from "srvx"
 import invariant from "tiny-invariant"
 
-import { ensurePaths } from "./lib/paths"
 import {
+  buildClaudeSettingsDefaultPromptValue,
+  buildClaudeSettingsPromptMessage,
+  buildClaudeSettingsSkipMessage,
+  inspectClaudeSettingsLocal,
   loadClaudeModelSlotsForTarget,
   syncClaudeSettingsGlobal,
   syncClaudeSettingsLocal,
+  syncClaudeSettingsPath,
   type ClaudeSettingsSyncTarget,
 } from "./lib/claude-settings"
+import { ensurePaths } from "./lib/paths"
 import {
   normalizeProviderRequestHandlingMode,
   resolveProviderConfig,
@@ -21,7 +26,11 @@ import {
   type ResolveProviderOptions,
 } from "./lib/provider-config"
 import { generateEnvScript } from "./lib/shell"
-import { state } from "./lib/state"
+import {
+  decodeRoutedModel,
+  encodeRoutedModel,
+  summarizeRoutedModel,
+} from "./lib/slot-routing"
 import {
   clearProviderModelSlots,
   getActiveProviderProfile,
@@ -33,12 +42,6 @@ import {
   upsertProviderProfile,
   type ProviderProfile,
 } from "./lib/startup-config"
-import { applyModelSlotDraft } from "./lib/switch-model-draft"
-import {
-  decodeRoutedModel,
-  encodeRoutedModel,
-  summarizeRoutedModel,
-} from "./lib/slot-routing"
 import {
   buildProviderDisplayLabel,
   buildSearchStatusLabel,
@@ -52,6 +55,8 @@ import {
   summarizeModelSlots,
   type ModelSlots,
 } from "./lib/startup-wizard"
+import { state } from "./lib/state"
+import { applyModelSlotDraft } from "./lib/switch-model-draft"
 import { persistSwitchConfig } from "./lib/switch-persistence"
 import { setupCopilotToken, setupGitHubToken } from "./lib/token"
 import { cacheModels, cacheVSCodeVersion } from "./lib/utils"
@@ -141,10 +146,13 @@ async function syncClaudeSettingsFromStartupConfig(
     return
   }
 
-  const envPatch = buildClaudeModelSlotEnv(normalizeModelSlots(active.modelSlots))
+  const envPatch = buildClaudeModelSlotEnv(
+    normalizeModelSlots(active.modelSlots),
+  )
 
-  const result = syncTarget === "global"
-    ? await syncClaudeSettingsGlobal(envPatch)
+  const result =
+    syncTarget === "global" ?
+      await syncClaudeSettingsGlobal(envPatch)
     : await syncClaudeSettingsLocal(process.cwd(), envPatch)
 
   if (result.updated && result.path) {
@@ -153,7 +161,9 @@ async function syncClaudeSettingsFromStartupConfig(
   }
 
   if (syncTarget === "local") {
-    consola.warn("No .claude/settings.local.json found to sync from current workspace path.")
+    consola.warn(
+      "No .claude/settings.local.json found to sync from current workspace path.",
+    )
   }
 }
 
@@ -263,8 +273,8 @@ export async function runServer(options: RunServerOptions): Promise<void> {
   await cacheModels()
 
   if (state.provider.mode === "openai-compatible") {
-    const configuredSlots = startupSelection.modelSlots
-      || deriveModelSlotsFromProviderPreferences()
+    const configuredSlots =
+      startupSelection.modelSlots || deriveModelSlotsFromProviderPreferences()
 
     if (configuredSlots) {
       consola.info(`Configured models: ${summarizeModelSlots(configuredSlots)}`)
@@ -308,17 +318,62 @@ export async function runServer(options: RunServerOptions): Promise<void> {
 
     const claudeEnv = buildClaudeModelEnv(serverUrl, selectedSlots)
 
-    const syncResult = await syncClaudeSettingsLocal(process.cwd(), claudeEnv)
-    if (syncResult.updated && syncResult.path) {
-      consola.info(`Synced Claude settings: ${syncResult.path}`)
-    } else {
-      consola.warn("No .claude/settings.local.json found to sync from current workspace path.")
+    const settingsInspection = await inspectClaudeSettingsLocal(process.cwd())
+
+    if (settingsInspection.status === "missing") {
+      consola.info(
+        `No existing local Claude settings found. A new settings file will be created at ${settingsInspection.path}.`,
+      )
     }
 
-    const command = generateEnvScript(
-      claudeEnv,
-      "claude",
-    )
+    let syncResult: { updated: boolean; path?: string }
+    if (settingsInspection.status === "missing") {
+      syncResult = await syncClaudeSettingsPath(
+        settingsInspection.path,
+        claudeEnv,
+      )
+    } else if (
+      settingsInspection.status === "loaded"
+      && settingsInspection.hasUnrelatedSettings
+    ) {
+      const shouldMerge = await promptConfirm(
+        buildClaudeSettingsPromptMessage(settingsInspection),
+        buildClaudeSettingsDefaultPromptValue(settingsInspection),
+      )
+
+      if (!shouldMerge) {
+        consola.warn(buildClaudeSettingsSkipMessage(settingsInspection))
+        syncResult = { updated: false }
+      } else {
+        syncResult = await syncClaudeSettingsPath(
+          settingsInspection.path,
+          claudeEnv,
+        )
+      }
+    } else if (settingsInspection.status === "invalid-json") {
+      const shouldOverwrite = await promptConfirm(
+        buildClaudeSettingsPromptMessage(settingsInspection),
+        buildClaudeSettingsDefaultPromptValue(settingsInspection),
+      )
+
+      if (!shouldOverwrite) {
+        consola.warn(buildClaudeSettingsSkipMessage(settingsInspection))
+        syncResult = { updated: false }
+      } else {
+        syncResult = await syncClaudeSettingsPath(
+          settingsInspection.path,
+          claudeEnv,
+        )
+      }
+    } else {
+      syncResult = await syncClaudeSettingsLocal(process.cwd(), claudeEnv)
+    }
+
+    if (syncResult.updated && syncResult.path) {
+      consola.info(`Synced Claude settings: ${syncResult.path}`)
+    }
+
+    const command = generateEnvScript(claudeEnv, "claude")
 
     try {
       clipboard.writeSync(command)
@@ -331,9 +386,7 @@ export async function runServer(options: RunServerOptions): Promise<void> {
     }
   }
 
-  consola.box(
-    `Dashboard: ${serverUrl}/dashboard`,
-  )
+  consola.box(`Dashboard: ${serverUrl}/dashboard`)
 
   serve({
     fetch: server.fetch as ServerHandler,
@@ -369,7 +422,9 @@ async function resolveStartupSelection(
   }
 }
 
-async function resolveSavedStartupSelection(): Promise<StartupSelection | undefined> {
+async function resolveSavedStartupSelection(): Promise<
+  StartupSelection | undefined
+> {
   const startupConfig = await loadStartupConfig()
   const active = getActiveProviderProfile(startupConfig)
 
@@ -378,7 +433,10 @@ async function resolveSavedStartupSelection(): Promise<StartupSelection | undefi
   }
 
   if (hasCompleteModelSlots(active.modelSlots)) {
-    return buildSelectionFromProfile(active, normalizeModelSlots(active.modelSlots))
+    return buildSelectionFromProfile(
+      active,
+      normalizeModelSlots(active.modelSlots),
+    )
   }
 
   return {
@@ -414,19 +472,26 @@ export async function runSwitchConfiguration(): Promise<void> {
   let workingConfig = await loadStartupConfig()
 
   if (workingConfig.providers.length === 0) {
-    consola.warn("No providers configured yet. Add a provider first in switch mode.")
+    consola.warn(
+      "No providers configured yet. Add a provider first in switch mode.",
+    )
     let added: StartupSelection
     try {
       added = await runAddProviderFlow(workingConfig, syncTarget)
     } catch (error) {
-      if (error instanceof PromptBackError || error instanceof PromptExitError) {
+      if (
+        error instanceof PromptBackError
+        || error instanceof PromptExitError
+      ) {
         return
       }
 
       throw error
     }
     workingConfig = await loadStartupConfig()
-    consola.info(`Initialized with provider ${added.providerOptions.provider || "custom"}`)
+    consola.info(
+      `Initialized with provider ${added.providerOptions.provider || "custom"}`,
+    )
   }
 
   const sessionSlotSource = await resolveSwitchSessionSlotSource(
@@ -439,9 +504,7 @@ export async function runSwitchConfiguration(): Promise<void> {
       `Loaded slot models from ${sessionSlotSource.path}: ${summarizeModelSlots(sessionSlotSource.slots)}`,
     )
   } else if (getActiveProviderProfile(workingConfig)) {
-    const targetLabel = syncTarget === "global"
-      ? "global"
-      : "local"
+    const targetLabel = syncTarget === "global" ? "global" : "local"
     consola.warn(
       `No slot models found in selected ${targetLabel} Claude settings file. Falling back to startup-config slot values.`,
     )
@@ -451,9 +514,7 @@ export async function runSwitchConfiguration(): Promise<void> {
 
   while (true) {
     const active = getActiveProviderProfile(workingConfig)
-    const activeLabel = active
-      ? `${active.label} (${active.id})`
-      : "none"
+    const activeLabel = active ? `${active.label} (${active.id})` : "none"
 
     let action: string
     try {
@@ -485,11 +546,7 @@ export async function runSwitchConfiguration(): Promise<void> {
 
         const exitDecision = await promptSelect(
           "Unsaved changes detected. What do you want to do?",
-          [
-            "Save changes and exit",
-            "Discard changes and exit",
-            "Back",
-          ],
+          ["Save changes and exit", "Discard changes and exit", "Back"],
           "Back",
           { spacing: "minor" },
         )
@@ -527,11 +584,7 @@ export async function runSwitchConfiguration(): Promise<void> {
 
           const exitDecision = await promptSelect(
             "Unsaved changes detected. What do you want to do?",
-            [
-              "Save changes and exit",
-              "Discard changes and exit",
-              "Back",
-            ],
+            ["Save changes and exit", "Discard changes and exit", "Back"],
             "Back",
             { spacing: "minor" },
           )
@@ -668,7 +721,9 @@ export async function runSwitchConfiguration(): Promise<void> {
       dirty = false
 
       if (workingConfig.providers.length === 0) {
-        consola.warn("No providers configured yet. Add a provider first in switch mode.")
+        consola.warn(
+          "No providers configured yet. Add a provider first in switch mode.",
+        )
         let added: StartupSelection
         try {
           added = await runAddProviderFlow(workingConfig, syncTarget)
@@ -704,11 +759,7 @@ export async function runSwitchConfiguration(): Promise<void> {
 
     const exitDecision = await promptSelect(
       "Unsaved changes detected. What do you want to do?",
-      [
-        "Save changes and exit",
-        "Discard changes and exit",
-        "Back",
-      ],
+      ["Save changes and exit", "Discard changes and exit", "Back"],
       "Back",
       { spacing: "minor" },
     )
@@ -737,15 +788,22 @@ async function runChangeModelDraft(
 }> {
   const active = getActiveProviderProfile(startupConfig)
   if (!active) {
-    throw new Error("No active provider found. Add a provider before changing model slots.")
+    throw new Error(
+      "No active provider found. Add a provider before changing model slots.",
+    )
   }
 
-  let modelSlots = resolveDisplayModelSlotsForProfile(active, slotSource)
+  let modelSlots =
+    resolveDisplayModelSlotsForProfile(active, slotSource)
     || normalizeModelSlots({
-      defaultModel: active.id === "openrouter" ? "qwen/qwen3.6-plus:free" : FALLBACK_MODEL,
-      bigModel: active.id === "openrouter" ? "qwen/qwen3.6-plus:free" : FALLBACK_MODEL,
-      sonnetModel: active.id === "openrouter" ? "qwen/qwen3.6-plus:free" : FALLBACK_MODEL,
-      haikuModel: active.id === "openrouter" ? "qwen/qwen3.6-plus:free" : FALLBACK_MODEL,
+      defaultModel:
+        active.id === "openrouter" ? "qwen/qwen3.6-plus:free" : FALLBACK_MODEL,
+      bigModel:
+        active.id === "openrouter" ? "qwen/qwen3.6-plus:free" : FALLBACK_MODEL,
+      sonnetModel:
+        active.id === "openrouter" ? "qwen/qwen3.6-plus:free" : FALLBACK_MODEL,
+      haikuModel:
+        active.id === "openrouter" ? "qwen/qwen3.6-plus:free" : FALLBACK_MODEL,
     })
 
   let updatedSlots = { ...modelSlots }
@@ -826,11 +884,7 @@ async function runChangeModelDraft(
 
     const nextValue = encodeRoutedModel(selectedProviderId, selectedModel)
     if (getSlotModel(updatedSlots, slot) !== nextValue) {
-      updatedSlots = setSlotModel(
-        updatedSlots,
-        slot,
-        nextValue,
-      )
+      updatedSlots = setSlotModel(updatedSlots, slot, nextValue)
       didChange = true
     }
   }
@@ -887,9 +941,9 @@ async function promptSlotProvider(
   return await promptSelect(
     "Search provider for slot",
     providerOptions,
-    providerOptions.some((option) => option.value === initialProviderId)
-      ? initialProviderId
-      : providerOptions[0]?.value,
+    providerOptions.some((option) => option.value === initialProviderId) ?
+      initialProviderId
+    : providerOptions[0]?.value,
     { spacing: "minor" },
   )
 }
@@ -910,7 +964,9 @@ async function promptModelForProviderSlot(
       )
     }
 
-    consola.warn("Could not load Copilot Pro models. Falling back to manual model entry.")
+    consola.warn(
+      "Could not load Copilot Pro models. Falling back to manual model entry.",
+    )
     return await promptText(`Enter Copilot model for ${slot}`, initialModel)
   }
 
@@ -925,10 +981,7 @@ async function promptModelForProviderSlot(
     profile.apiKey,
   )
   if (availableModels.length === 0) {
-    return await promptText(
-      `Enter model id for ${slot}`,
-      initialModel,
-    )
+    return await promptText(`Enter model id for ${slot}`, initialModel)
   }
 
   return await promptModelFromSearch(
@@ -967,7 +1020,10 @@ async function fetchCopilotModelsForSlotSelection(): Promise<Array<string>> {
     await cacheModels()
     return getCopilotModelIds(state.models)
   } catch (error) {
-    consola.warn("Failed to load Copilot Pro model list for slot selection.", error)
+    consola.warn(
+      "Failed to load Copilot Pro model list for slot selection.",
+      error,
+    )
     return []
   } finally {
     state.provider = previousProvider
@@ -1024,14 +1080,17 @@ async function runAddProviderFlow(
   startupConfig: Awaited<ReturnType<typeof loadStartupConfig>>,
   syncTarget: ClaudeSettingsSyncTarget,
 ): Promise<StartupSelection> {
-  const providerChoice = await promptProviderChoiceForAdd(startupConfig.providers)
+  const providerChoice = await promptProviderChoiceForAdd(
+    startupConfig.providers,
+  )
   const apiKey = await promptProviderApiKey(providerChoice)
   const requestHandlingMode = await promptRequestHandlingMode(
     providerChoice.existingProfile?.requestHandlingMode,
   )
 
-  const modelSlots = hasCompleteModelSlots(providerChoice.existingProfile?.modelSlots)
-    ? normalizeModelSlots(providerChoice.existingProfile.modelSlots)
+  const modelSlots =
+    hasCompleteModelSlots(providerChoice.existingProfile?.modelSlots) ?
+      normalizeModelSlots(providerChoice.existingProfile.modelSlots)
     : buildDefaultModelSlotsForProvider(providerChoice.id)
 
   const updatedProfile: ProviderProfile = {
@@ -1055,7 +1114,9 @@ async function runAddProviderFlow(
   consola.info(
     `Request handling mode: ${formatRequestHandlingModeLabel(requestHandlingMode)}`,
   )
-  consola.info("Provider added. Use \"Change model mappings\" when you want to update slot models.")
+  consola.info(
+    'Provider added. Use "Change model mappings" when you want to update slot models.',
+  )
   consola.info(`Current model mappings: ${summarizeModelSlots(modelSlots)}`)
   return buildSelectionFromProfile(updatedProfile, modelSlots)
 }
@@ -1066,13 +1127,14 @@ async function runUpdateProviderFlow(
   providerId?: string,
   slotSource?: SwitchSessionSlotSource,
 ): Promise<StartupSelection> {
-  const profile = providerId
-    ? startupConfig.providers.find((provider) => provider.id === providerId)
+  const profile =
+    providerId ?
+      startupConfig.providers.find((provider) => provider.id === providerId)
     : await promptExistingProviderProfile(
-      startupConfig.providers,
-      "Search provider to update",
-      slotSource,
-    )
+        startupConfig.providers,
+        "Search provider to update",
+        slotSource,
+      )
 
   if (!profile) {
     throw new Error("No provider available to update")
@@ -1104,23 +1166,26 @@ async function runUpdateProviderFlow(
     updateSelection === "Update request handling mode"
     || updateSelection === "Update API key and request handling mode"
 
-  const apiKey = shouldUpdateApiKey
-    ? await promptProviderApiKey({
-      id: profile.id,
-      label: profile.label,
-      baseUrl: profile.baseUrl,
-      apiKeyUrl: profile.apiKeyUrl,
-      isPreset: profile.isPreset,
-      existingProfile: profile,
-    })
+  const apiKey =
+    shouldUpdateApiKey ?
+      await promptProviderApiKey({
+        id: profile.id,
+        label: profile.label,
+        baseUrl: profile.baseUrl,
+        apiKeyUrl: profile.apiKeyUrl,
+        isPreset: profile.isPreset,
+        existingProfile: profile,
+      })
     : profile.apiKey
 
-  const modelSlots = hasCompleteModelSlots(profile.modelSlots)
-    ? normalizeModelSlots(profile.modelSlots)
+  const modelSlots =
+    hasCompleteModelSlots(profile.modelSlots) ?
+      normalizeModelSlots(profile.modelSlots)
     : buildDefaultModelSlotsForProvider(profile.id)
 
-  const requestHandlingMode = shouldUpdateRequestHandlingMode
-    ? await promptRequestHandlingMode(profile.requestHandlingMode)
+  const requestHandlingMode =
+    shouldUpdateRequestHandlingMode ?
+      await promptRequestHandlingMode(profile.requestHandlingMode)
     : normalizeProviderRequestHandlingMode(profile.requestHandlingMode)
 
   const updatedProfile: ProviderProfile = {
@@ -1140,7 +1205,9 @@ async function runUpdateProviderFlow(
   consola.info(
     `Request handling mode: ${formatRequestHandlingModeLabel(requestHandlingMode)}`,
   )
-  consola.info("Provider metadata updated. Slot model changes remain in \"Change model mappings\".")
+  consola.info(
+    'Provider metadata updated. Slot model changes remain in "Change model mappings".',
+  )
   consola.info(`Current model mappings: ${summarizeModelSlots(modelSlots)}`)
   return buildSelectionFromProfile(updatedProfile, modelSlots)
 }
@@ -1161,11 +1228,10 @@ async function runSwitchProviderFlow(
   }
 
   let modelSlots: ModelSlots
-  if (hasCompleteModelSlots(selectedProfile.modelSlots)) {
-    modelSlots = normalizeModelSlots(selectedProfile.modelSlots)
-  } else {
-    modelSlots = buildDefaultModelSlotsForProvider(selectedProfile.id)
-  }
+  modelSlots =
+    hasCompleteModelSlots(selectedProfile.modelSlots) ?
+      normalizeModelSlots(selectedProfile.modelSlots)
+    : buildDefaultModelSlotsForProvider(selectedProfile.id)
 
   const refreshedProfile: ProviderProfile = {
     ...selectedProfile,
@@ -1199,7 +1265,9 @@ async function runDeleteModelMappingsFlow(
   }
 
   if (!hasCompleteModelSlots(profile.modelSlots)) {
-    consola.warn(`Provider ${profile.label} has no saved model mappings to delete.`)
+    consola.warn(
+      `Provider ${profile.label} has no saved model mappings to delete.`,
+    )
     return
   }
 
@@ -1250,7 +1318,9 @@ async function runDeleteProviderFlow(
   consola.success(`Deleted provider ${profile.label} (${profile.id}).`)
 
   if (nextActive) {
-    consola.info(`Active provider is now ${nextActive.label} (${nextActive.id}).`)
+    consola.info(
+      `Active provider is now ${nextActive.label} (${nextActive.id}).`,
+    )
   } else {
     consola.warn("No providers remain configured.")
   }
@@ -1343,10 +1413,13 @@ async function promptExistingProviderProfile(
 
   const options: Array<SearchableOption> = profiles.map((profile) => {
     const displaySlots = resolveDisplayModelSlotsForProfile(profile, slotSource)
-    const slotSummary = displaySlots
-      ? summarizeModelSlotsForList(displaySlots)
+    const slotSummary =
+      displaySlots ?
+        summarizeModelSlotsForList(displaySlots)
       : "models not configured"
-    const requestMode = formatRequestHandlingModeLabel(profile.requestHandlingMode)
+    const requestMode = formatRequestHandlingModeLabel(
+      profile.requestHandlingMode,
+    )
 
     return {
       value: profile.id,
@@ -1421,7 +1494,8 @@ async function promptClaudeSettingsSyncTarget(
       {
         value: "local",
         label: "Local workspace settings",
-        description: "Update nearest .claude/settings.local.json in this workspace",
+        description:
+          "Update nearest .claude/settings.local.json in this workspace",
         searchText: "local workspace settings.local.json",
       },
       {
@@ -1452,13 +1526,15 @@ async function promptRequestHandlingMode(
       {
         value: "strict",
         label: "strict",
-        description: "Exactly one upstream call (no auto retry or compatibility fallback)",
+        description:
+          "Exactly one upstream call (no auto retry or compatibility fallback)",
         searchText: "single request one call no retry no fallback",
       },
       {
         value: "balanced",
         label: "balanced",
-        description: "Bounded retries and compatibility fallback with call budget",
+        description:
+          "Bounded retries and compatibility fallback with call budget",
         searchText: "default retry fallback budget",
       },
       {
@@ -1532,17 +1608,24 @@ async function fetchProviderModels(
       return []
     }
 
-    return [...new Set(
-      payload.data
-        .map((model) => model.id)
-        .filter((id): id is string => typeof id === "string" && id.length > 0),
-    )]
+    return [
+      ...new Set(
+        payload.data
+          .map((model) => model.id)
+          .filter(
+            (id): id is string => typeof id === "string" && id.length > 0,
+          ),
+      ),
+    ]
   } catch {
     return []
   }
 }
 
-function isGeminiAiStudioProvider(providerId: string, baseUrl: string): boolean {
+function isGeminiAiStudioProvider(
+  providerId: string,
+  baseUrl: string,
+): boolean {
   if (providerId.trim().toLowerCase() === "gemini") {
     return true
   }
@@ -1569,11 +1652,14 @@ async function fetchGeminiAiStudioModels(
   }
 
   try {
-    const response = await fetch(resolveGeminiNativeModelsUrl(baseUrl, apiKey), {
-      headers: {
-        accept: "application/json",
+    const response = await fetch(
+      resolveGeminiNativeModelsUrl(baseUrl, apiKey),
+      {
+        headers: {
+          accept: "application/json",
+        },
       },
-    })
+    )
 
     if (!response.ok) {
       return []
@@ -1590,30 +1676,34 @@ async function fetchGeminiAiStudioModels(
       return []
     }
 
-    return [...new Set(
-      payload.models
-        .filter((model) => {
-          if (typeof model.name !== "string") {
-            return false
-          }
+    return [
+      ...new Set(
+        payload.models
+          .filter((model) => {
+            if (typeof model.name !== "string") {
+              return false
+            }
 
-          const methods = model.supportedGenerationMethods
-          if (!Array.isArray(methods)) {
-            return true
-          }
+            const methods = model.supportedGenerationMethods
+            if (!Array.isArray(methods)) {
+              return true
+            }
 
-          return methods.some((method) =>
-            method === "generateContent" || method === "streamGenerateContent",
-          )
-        })
-        .map((model) => model.name as string)
-        .filter((name) => name.startsWith("models/"))
-        .map((name) => name.slice("models/".length))
-        .filter((name) => name.toLowerCase().includes("gemini"))
-        .filter((name) => !name.toLowerCase().includes("embedding"))
-        .filter((name) => !name.toLowerCase().includes("aqa"))
-        .sort((a, b) => a.localeCompare(b)),
-    )]
+            return methods.some(
+              (method) =>
+                method === "generateContent"
+                || method === "streamGenerateContent",
+            )
+          })
+          .map((model) => model.name as string)
+          .filter((name) => name.startsWith("models/"))
+          .map((name) => name.slice("models/".length))
+          .filter((name) => name.toLowerCase().includes("gemini"))
+          .filter((name) => !name.toLowerCase().includes("embedding"))
+          .filter((name) => !name.toLowerCase().includes("aqa"))
+          .sort((a, b) => a.localeCompare(b)),
+      ),
+    ]
   } catch {
     return []
   }
@@ -1626,36 +1716,28 @@ async function promptModelFromSearch(
 ): Promise<string> {
   const featured = getFeaturedModelCandidates(models, 18)
   const manualOption = `Enter model id manually for ${slotLabel}`
-  const orderedModels = [...new Set(
-    [
+  const orderedModels = [
+    ...new Set([
       ...(initialModel ? [initialModel] : []),
       ...featured,
       ...models,
-    ],
-  )]
+    ]),
+  ]
 
   while (true) {
-    const shortlist = [...new Set(
-      [
-        ...orderedModels,
-        manualOption,
-      ],
-    )]
+    const shortlist = [...new Set([...orderedModels, manualOption])]
 
     const selected = await promptSelect(
       `Search ${slotLabel}`,
       shortlist,
-      initialModel && shortlist.includes(initialModel)
-        ? initialModel
-        : shortlist[0],
+      initialModel && shortlist.includes(initialModel) ?
+        initialModel
+      : shortlist[0],
       { spacing: "minor" },
     )
 
     if (selected === manualOption) {
-      return await promptText(
-        `Enter ${slotLabel}`,
-        initialModel,
-      )
+      return await promptText(`Enter ${slotLabel}`, initialModel)
     }
 
     return selected
@@ -1671,22 +1753,23 @@ function deriveModelSlotsFromProviderPreferences(): ModelSlots | undefined {
     defaultModel: state.provider.preferredModel,
     bigModel: state.provider.preferredModel,
     sonnetModel: state.provider.preferredModel,
-    haikuModel: state.provider.preferredSmallModel || state.provider.preferredModel,
+    haikuModel:
+      state.provider.preferredSmallModel || state.provider.preferredModel,
   })
 }
 
 function hasExplicitProviderConfiguration(options: RunServerOptions): boolean {
   return Boolean(
     options.provider
-      || options.providerBaseUrl
-      || options.providerApiKey
-      || options.providerModel
-      || options.providerSmallModel
-      || process.env.PROVIDER
-      || process.env.PROVIDER_BASE_URL
-      || process.env.PROVIDER_API_KEY
-      || process.env.PROVIDER_MODEL
-      || process.env.PROVIDER_SMALL_MODEL,
+    || options.providerBaseUrl
+    || options.providerApiKey
+    || options.providerModel
+    || options.providerSmallModel
+    || process.env.PROVIDER
+    || process.env.PROVIDER_BASE_URL
+    || process.env.PROVIDER_API_KEY
+    || process.env.PROVIDER_MODEL
+    || process.env.PROVIDER_SMALL_MODEL,
   )
 }
 
@@ -1698,12 +1781,12 @@ function buildCustomProviderId(label: string, baseUrl: string): string {
   const namePart = label
     .trim()
     .toLowerCase()
-    .replace(/[^a-z0-9]+/g, "-")
-    .replace(/^-+|-+$/g, "")
+    .replaceAll(/[^a-z0-9]+/g, "-")
+    .replaceAll(/^-+|-+$/g, "")
 
   try {
     const parsed = new URL(baseUrl)
-    const host = parsed.hostname.replace(/[^a-zA-Z0-9]/g, "-")
+    const host = parsed.hostname.replaceAll(/[^a-z0-9]/gi, "-")
 
     const combined = [namePart, host]
       .filter((value) => value.length > 0)
@@ -1716,7 +1799,8 @@ function buildCustomProviderId(label: string, baseUrl: string): string {
 }
 
 function buildDefaultModelSlotsForProvider(providerId: string): ModelSlots {
-  const baseModel = providerId === "openrouter" ? "qwen/qwen3.6-plus:free" : FALLBACK_MODEL
+  const baseModel =
+    providerId === "openrouter" ? "qwen/qwen3.6-plus:free" : FALLBACK_MODEL
 
   return normalizeModelSlots({
     defaultModel: baseModel,
@@ -1750,8 +1834,8 @@ async function promptSelect(
       label: option.label,
       short: option.label,
       description: option.description,
-      normalized: `${option.label} ${option.value} ${option.searchText || ""}`
-        .toLowerCase(),
+      normalized:
+        `${option.label} ${option.value} ${option.searchText || ""}`.toLowerCase(),
     }
   })
 
@@ -1761,20 +1845,27 @@ async function promptSelect(
   try {
     selected = await promptSearchSelect<string>({
       message: `${message}\nSearch:`,
-      default: initial
-        && normalizedOptions.some((option) => option.value === initial)
-        ? initial
+      default:
+        (
+          initial
+          && normalizedOptions.some((option) => option.value === initial)
+        ) ?
+          initial
         : normalizedOptions[0]?.value,
       source: async (term) => {
-        const q = String(term || "").trim().toLowerCase()
-        const filtered = q.length === 0
-          ? normalizedOptions
+        const q = String(term || "")
+          .trim()
+          .toLowerCase()
+        const filtered =
+          q.length === 0 ?
+            normalizedOptions
           : normalizedOptions.filter((option) => option.normalized.includes(q))
 
         matchCount = filtered.length
 
-        const visibleOptions = filtered.length > 0
-          ? filtered
+        const visibleOptions =
+          filtered.length > 0 ?
+            filtered
           : [
               {
                 value: "__no_results__",
@@ -1789,10 +1880,10 @@ async function promptSelect(
           value: option.value,
           name: `  ${option.label}`,
           short: option.short,
-          description: option.description ? `  ${option.description}` : undefined,
-          disabled: option.value === "__no_results__"
-            ? "Type to search"
-            : undefined,
+          description:
+            option.description ? `  ${option.description}` : undefined,
+          disabled:
+            option.value === "__no_results__" ? "Type to search" : undefined,
         }))
       },
       theme: {
@@ -1804,16 +1895,16 @@ async function promptSelect(
             }
 
             // Keep cursor at the end of typed query while still showing match count.
-            const trailing = status.length > text.length
-              ? status.slice(text.length)
-              : ""
+            const trailing =
+              status.length > text.length ? status.slice(text.length) : ""
             if (!trailing) {
               return status
             }
 
             return `${status}\u001b[${trailing.length}D`
           },
-          keysHelpTip: () => "Up/Down to select | Enter: confirm | Type: to search",
+          keysHelpTip: () =>
+            "Up/Down to select | Enter: confirm | Type: to search",
         },
       },
       pageSize: 14,
@@ -1845,7 +1936,10 @@ function isPromptCancellationError(error: unknown): boolean {
   )
 }
 
-async function promptConfirm(message: string, initial: boolean): Promise<boolean> {
+async function promptConfirm(
+  message: string,
+  initial: boolean,
+): Promise<boolean> {
   const selected = await consola.prompt(message, {
     type: "confirm",
     initial,
@@ -1854,7 +1948,10 @@ async function promptConfirm(message: string, initial: boolean): Promise<boolean
   return Boolean(selected)
 }
 
-async function promptText(message: string, defaultValue?: string): Promise<string> {
+async function promptText(
+  message: string,
+  defaultValue?: string,
+): Promise<string> {
   while (true) {
     const withDefault = defaultValue ? `${message} [${defaultValue}]` : message
     const value = await consola.prompt(withDefault, {
@@ -1913,14 +2010,18 @@ function getSlotModel(
   slot: "default" | "opus" | "sonnet" | "haiku",
 ): string {
   switch (slot) {
-    case "default":
+    case "default": {
       return slots.defaultModel
-    case "opus":
+    }
+    case "opus": {
       return slots.bigModel
-    case "sonnet":
+    }
+    case "sonnet": {
       return slots.sonnetModel
-    case "haiku":
+    }
+    case "haiku": {
       return slots.haikuModel
+    }
   }
 }
 
@@ -2040,8 +2141,7 @@ export const start = defineCommand({
     },
     "provider-request-handling-mode": {
       type: "string",
-      description:
-        "Provider request policy: strict, balanced, or resilient",
+      description: "Provider request policy: strict, balanced, or resilient",
     },
   },
   run({ args }) {

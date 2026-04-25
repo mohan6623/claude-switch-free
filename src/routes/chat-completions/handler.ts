@@ -21,6 +21,11 @@ export async function handleCompletion(c: Context) {
   let payload = await c.req.json<ChatCompletionsPayload>()
   consola.debug("Request payload:", JSON.stringify(payload).slice(-400))
 
+  // Log incoming request details
+  console.log(`[CHAT/COMPLETIONS HANDLER] Received model: ${payload.model}`)
+  console.log(`[CHAT/COMPLETIONS HANDLER] Current provider mode: ${state.provider.mode}`)
+  console.log(`[CHAT/COMPLETIONS HANDLER] Current provider id: ${state.provider.id}`)
+
   // Find the selected model
   const selectedModel = state.models?.data.find(
     (model) => model.id === payload.model,

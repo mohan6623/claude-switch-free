@@ -45,6 +45,13 @@ export async function handleCompletion(c: Context) {
     },
   )
 
+  // Log route details for debugging
+  console.log(`[MESSAGES HANDLER] Original model: ${anthropicPayload.model}`)
+  console.log(`[MESSAGES HANDLER] Translated model: ${openAIPayload.model}`)
+  console.log(`[MESSAGES HANDLER] Provider override: ${translated.providerIdOverride || "none"}`)
+  console.log(`[MESSAGES HANDLER] Resolved provider: ${providerOverride?.id || "default (copilot)"}`)
+  console.log(`[MESSAGES HANDLER] Provider mode: ${providerOverride?.mode || state.provider.mode}`)
+
   if (state.manualApprove) {
     await awaitApproval()
   }
