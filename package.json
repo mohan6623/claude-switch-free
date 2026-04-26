@@ -7,11 +7,11 @@
     "github-copilot",
     "openai-compatible"
   ],
-  "homepage": "https://github.com/ericc-ch/claude-switch",
-  "bugs": "https://github.com/ericc-ch/claude-switch/issues",
+  "homepage": "https://github.com/mohan6623/claude-switch-free",
+  "bugs": "https://github.com/mohan6623/claude-switch-free/issues",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/ericc-ch/claude-switch.git"
+    "url": "git+https://github.com/mohan6623/claude-switch-free.git"
   },
   "author": "Erick Christian <erickchristian48@gmail.com>",
   "type": "module",
