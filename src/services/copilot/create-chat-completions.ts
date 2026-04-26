@@ -21,6 +21,8 @@ const providerQueueById = new Map<string, Promise<void>>()
 const providerCooldownUntilById = new Map<string, number>()
 
 const DEFAULT_RATE_LIMIT_COOLDOWN_MS = 1_500
+const COPILOT_RATE_LIMIT_FALLBACK_COOLDOWN_MS = 60_000
+const COPILOT_MAX_RATE_LIMIT_COOLDOWN_MS = 7 * 24 * 60 * 60 * 1000
 const BALANCED_MAX_RATE_LIMIT_RETRIES = 2
 const BALANCED_MAX_AUTORETRY_DELAY_MS = 12_000
 
@@ -127,6 +129,7 @@ async function createChatCompletionsInternal(
   }
 
   if (!state.copilotToken) throw new Error("Copilot token not found")
+  throwIfCopilotRateLimitCooldownActive()
 
   // Agent/user check for X-Initiator header
   // Determine if any message is from an agent ("assistant" or "tool")
@@ -137,6 +140,8 @@ async function createChatCompletionsInternal(
   const appliedFallbacks = new Set<string>()
 
   while (true) {
+    throwIfCopilotRateLimitCooldownActive()
+
     const enableVision = payloadHasImages(workingPayload)
 
     // Build headers and add X-Initiator
@@ -155,6 +160,10 @@ async function createChatCompletionsInternal(
 
     if (!response.ok) {
       const errorText = await response.clone().text()
+
+      if (response.status === 429) {
+        setCopilotRateLimitState(response, errorText, "chat/completions")
+      }
 
       if (shouldRetryCopilotViaResponses(response.status, errorText)) {
         consola.warn(
@@ -208,6 +217,7 @@ async function createChatCompletionsInternal(
     }
 
     if (workingPayload.stream) {
+      clearCopilotRateLimitState()
       await writeEvent({
         statusCode: 200,
         latencyMs: Date.now() - startTime,
@@ -217,6 +227,7 @@ async function createChatCompletionsInternal(
     }
 
     const parsed = (await response.json()) as ChatCompletionResponse
+    clearCopilotRateLimitState()
     await writeEvent({
       statusCode: 200,
       latencyMs: Date.now() - startTime,
@@ -304,10 +315,17 @@ async function createCopilotResponsesFallback(
     body: JSON.stringify(buildCopilotResponsesPayload(payload)),
   })
 
+  if (response.status === 429) {
+    const errorText = await response.clone().text()
+    setCopilotRateLimitState(response, errorText, "responses")
+  }
+
   if (!response.ok) {
     consola.error("Failed to create chat completions", response)
     throw new HTTPError("Failed to create chat completions", response)
   }
+
+  clearCopilotRateLimitState()
 
   const parsed = (await response.json()) as unknown
   const chatCompletion = mapResponsesToChatCompletion(parsed, payload.model)
@@ -699,6 +717,199 @@ function shouldRetryCopilotViaResponses(
     normalized.includes("unsupported_api_for_model")
     && normalized.includes("/chat/completions")
   )
+}
+
+function throwIfCopilotRateLimitCooldownActive(): void {
+  const cooldown = state.copilotRateLimitState
+  if (!cooldown) {
+    return
+  }
+
+  const remainingMs = cooldown.cooldownUntilMs - Date.now()
+  if (remainingMs <= 0) {
+    clearCopilotRateLimitState()
+    return
+  }
+
+  const remainingSeconds = Math.max(1, Math.ceil(remainingMs / 1000))
+  const headers = new Headers(cooldown.responseHeaders)
+  headers.set("retry-after", String(remainingSeconds))
+
+  if (!headers.has("x-ratelimit-user-retry-after")) {
+    headers.set("x-ratelimit-user-retry-after", String(remainingSeconds))
+  }
+
+  throw new HTTPError(
+    "Copilot rate limit cooldown active",
+    new Response(cooldown.responseBody, {
+      status: 429,
+      headers,
+    }),
+  )
+}
+
+function clearCopilotRateLimitState(): void {
+  state.copilotRateLimitState = undefined
+}
+
+function setCopilotRateLimitState(
+  response: Response,
+  errorText: string,
+  sourceEndpoint: "chat/completions" | "responses",
+): void {
+  const delayMs = getCopilotRateLimitDelayMs(response, errorText)
+  if (delayMs <= 0) {
+    return
+  }
+
+  const cooldownUntilMs = Date.now() + delayMs
+  const previousCooldownUntilMs = state.copilotRateLimitState?.cooldownUntilMs || 0
+  const effectiveCooldownUntilMs = Math.max(
+    previousCooldownUntilMs,
+    cooldownUntilMs,
+  )
+
+  const responseHeaders = pickCopilotRateLimitHeaders(response)
+  const remainingSeconds = Math.max(
+    1,
+    Math.ceil((effectiveCooldownUntilMs - Date.now()) / 1000),
+  )
+
+  if (!responseHeaders["retry-after"]) {
+    responseHeaders["retry-after"] = String(remainingSeconds)
+  }
+
+  if (!responseHeaders["x-ratelimit-user-retry-after"]) {
+    responseHeaders["x-ratelimit-user-retry-after"] = String(remainingSeconds)
+  }
+
+  state.copilotRateLimitState = {
+    cooldownUntilMs: effectiveCooldownUntilMs,
+    responseBody:
+      errorText
+      || JSON.stringify({
+        error: {
+          message: "Copilot rate limit exceeded",
+          type: "error",
+        },
+      }),
+    responseHeaders,
+    sourceEndpoint,
+  }
+}
+
+function pickCopilotRateLimitHeaders(response: Response): Record<string, string> {
+  const headerNames = [
+    "retry-after",
+    "x-ratelimit-user-retry-after",
+    "x-ratelimit-exceeded",
+    "ratelimit-reset",
+    "x-ratelimit-reset",
+    "x-ratelimit-reset-requests",
+    "x-rate-limit-reset",
+  ]
+
+  const selected: Record<string, string> = {}
+  for (const headerName of headerNames) {
+    const value = response.headers.get(headerName)
+    if (value) {
+      selected[headerName] = value
+    }
+  }
+
+  return selected
+}
+
+function getCopilotRateLimitDelayMs(response: Response, errorText: string): number {
+  const userRetryAfter = parseRetryAfterHeader(
+    response.headers.get("x-ratelimit-user-retry-after"),
+  )
+  if (userRetryAfter !== undefined) {
+    return clampCopilotRateLimitDelayMs(userRetryAfter)
+  }
+
+  const retryAfter = parseRetryAfterHeader(response.headers.get("retry-after"))
+  if (retryAfter !== undefined) {
+    return clampCopilotRateLimitDelayMs(retryAfter)
+  }
+
+  const resetHeaders = [
+    response.headers.get("x-ratelimit-reset-requests"),
+    response.headers.get("x-ratelimit-reset"),
+    response.headers.get("ratelimit-reset"),
+    response.headers.get("x-rate-limit-reset"),
+  ]
+
+  for (const header of resetHeaders) {
+    const parsed = parseRateLimitResetHeader(header)
+    if (parsed !== undefined) {
+      return clampCopilotRateLimitDelayMs(parsed)
+    }
+  }
+
+  const parsedFromBody = parseRetryAfterFromErrorText(errorText)
+  if (parsedFromBody !== undefined) {
+    return clampCopilotRateLimitDelayMs(parsedFromBody)
+  }
+
+  const exceeded = (response.headers.get("x-ratelimit-exceeded") || "").toLowerCase()
+  if (exceeded.includes("weekly")) {
+    return clampCopilotRateLimitDelayMs(COPILOT_MAX_RATE_LIMIT_COOLDOWN_MS)
+  }
+
+  return clampCopilotRateLimitDelayMs(COPILOT_RATE_LIMIT_FALLBACK_COOLDOWN_MS)
+}
+
+function parseRetryAfterFromErrorText(errorText: string): number | undefined {
+  if (!errorText) {
+    return undefined
+  }
+
+  try {
+    const parsed = JSON.parse(errorText) as unknown
+    const root = asRecord(parsed)
+    const errorRecord = asRecord(root.error)
+
+    const candidates: Array<unknown> = [
+      errorRecord["retry_after"],
+      errorRecord["retry-after"],
+      root["retry_after"],
+      root["retry-after"],
+    ]
+
+    for (const candidate of candidates) {
+      const parsedCandidate = parseRetryAfterCandidate(candidate)
+      if (parsedCandidate !== undefined) {
+        return parsedCandidate
+      }
+    }
+  } catch {
+    // Error text can be plain text; continue with regex fallback.
+  }
+
+  const regexMatch = errorText.match(/retry[_-]?after[^\d]*(\d+(?:\.\d+)?)/i)
+  if (!regexMatch) {
+    return undefined
+  }
+
+  const rawValue = regexMatch[1]
+  if (!rawValue) {
+    return undefined
+  }
+
+  return Number(rawValue) * 1000
+}
+
+function parseRetryAfterCandidate(value: unknown): number | undefined {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return value * 1000
+  }
+
+  if (typeof value === "string") {
+    return parseRetryAfterHeader(value)
+  }
+
+  return undefined
 }
 
 function asRecord(input: unknown): Record<string, unknown> {
@@ -1646,6 +1857,14 @@ function clampRateLimitDelayMs(delayMs: number): number {
   }
 
   return Math.min(delayMs, 300_000)
+}
+
+function clampCopilotRateLimitDelayMs(delayMs: number): number {
+  if (!Number.isFinite(delayMs) || delayMs <= 0) {
+    return 0
+  }
+
+  return Math.min(delayMs, COPILOT_MAX_RATE_LIMIT_COOLDOWN_MS)
 }
 
 function payloadHasImages(payload: ChatCompletionsPayload): boolean {

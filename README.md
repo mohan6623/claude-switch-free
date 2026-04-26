@@ -1,7 +1,7 @@
-# Copilot API Proxy
+# Claude Switch Proxy
 
 > [!WARNING]
-> This is a reverse-engineered proxy of GitHub Copilot API. It is not supported by GitHub, and may break unexpectedly. Use at your own risk.
+> This is a reverse-engineered proxy of GitHub Claude Switch. It is not supported by GitHub, and may break unexpectedly. Use at your own risk.
 
 > [!WARNING]
 > **GitHub Security Notice:**  
@@ -27,14 +27,14 @@
 
 ## Project Overview
 
-A reverse-engineered proxy for the GitHub Copilot API that exposes it as an OpenAI and Anthropic compatible service. This allows you to use GitHub Copilot with any tool that supports the OpenAI Chat Completions API or the Anthropic Messages API, including to power [Claude Code](https://docs.anthropic.com/en/docs/claude-code/overview).
+A reverse-engineered proxy for the GitHub Claude Switch that exposes it as an OpenAI and Anthropic compatible service. This allows you to use GitHub Copilot with any tool that supports the OpenAI Chat Completions API or the Anthropic Messages API, including to power [Claude Code](https://docs.anthropic.com/en/docs/claude-code/overview).
 
 ## Features
 
 - **OpenAI & Anthropic Compatibility**: Exposes GitHub Copilot as an OpenAI-compatible (`/v1/chat/completions`, `/v1/models`, `/v1/embeddings`) and Anthropic-compatible (`/v1/messages`) API.
 - **Claude Code Integration**: Easily configure and launch [Claude Code](https://docs.anthropic.com/en/docs/claude-code/overview) to use Copilot as its backend with a simple command-line flag (`--claude-code`).
 - **Interactive Startup Wizard**: On startup, choose `Copilot Pro` or `Providers`. Provider mode supports preset/custom providers, saved API keys, and saved model slots (default, opus, sonnet, haiku) with keep-or-change prompts on restart.
-- **Usage Dashboard**: A web-based dashboard to monitor your Copilot API usage, view quotas, and see detailed statistics.
+- **Usage Dashboard**: A web-based dashboard to monitor your Claude Switch usage, view quotas, and see detailed statistics.
 - **Rate Limit Control**: Manage API usage with rate-limiting options (`--rate-limit`) and a waiting mechanism (`--wait`) to prevent errors from rapid requests.
 - **Manual Request Approval**: Manually approve or deny each API request for fine-grained control over usage (`--manual`).
 - **Token Visibility**: Option to display GitHub and Copilot tokens during authentication and refresh for debugging (`--show-token`).
@@ -63,7 +63,7 @@ bun install
 Build image
 
 ```sh
-docker build -t copilot-api .
+docker build -t claude-switch .
 ```
 
 Run the container
@@ -75,11 +75,11 @@ mkdir -p ./copilot-data
 # Run the container with a bind mount to persist the token
 # This ensures your authentication survives container restarts
 
-docker run -p 4141:4141 -v $(pwd)/copilot-data:/root/.local/share/copilot-api copilot-api
+docker run -p 4141:4141 -v $(pwd)/copilot-data:/root/.local/share/claude-switch claude-switch
 ```
 
 > **Note:**
-> The GitHub token and related data will be stored in `copilot-data` on your host. This is mapped to `/root/.local/share/copilot-api` inside the container, ensuring persistence across restarts.
+> The GitHub token and related data will be stored in `copilot-data` on your host. This is mapped to `/root/.local/share/claude-switch` inside the container, ensuring persistence across restarts.
 
 ### Docker with Environment Variables
 
@@ -87,13 +87,13 @@ You can pass the GitHub token directly to the container using environment variab
 
 ```sh
 # Build with GitHub token
-docker build --build-arg GH_TOKEN=your_github_token_here -t copilot-api .
+docker build --build-arg GH_TOKEN=your_github_token_here -t claude-switch .
 
 # Run with GitHub token
-docker run -p 4141:4141 -e GH_TOKEN=your_github_token_here copilot-api
+docker run -p 4141:4141 -e GH_TOKEN=your_github_token_here claude-switch
 
 # Run with additional options
-docker run -p 4141:4141 -e GH_TOKEN=your_token copilot-api start --verbose --port 4141
+docker run -p 4141:4141 -e GH_TOKEN=your_token claude-switch start --verbose --port 4141
 ```
 
 ### Docker Compose Example
@@ -101,7 +101,7 @@ docker run -p 4141:4141 -e GH_TOKEN=your_token copilot-api start --verbose --por
 ```yaml
 version: "3.8"
 services:
-  copilot-api:
+  claude-switch:
     build: .
     ports:
       - "4141:4141"
@@ -122,26 +122,26 @@ The Docker image includes:
 You can run the project directly using npx:
 
 ```sh
-npx copilot-api@latest start
+npx claude-switch@latest start
 ```
 
 With options:
 
 ```sh
-npx copilot-api@latest start --port 8080
+npx claude-switch@latest start --port 8080
 ```
 
 For authentication only:
 
 ```sh
-npx copilot-api@latest auth
+npx claude-switch@latest auth
 ```
 
 ## Command Structure
 
-Copilot API now uses a subcommand structure with these main commands:
+Claude Switch now uses a subcommand structure with these main commands:
 
-- `start`: Start the Copilot API server. This command will also handle authentication if needed.
+- `start`: Start the Claude Switch server. This command will also handle authentication if needed.
 - `auth`: Run GitHub authentication flow without starting the server. This is typically used if you need to generate a token for use with the `--github-token` option, especially in non-interactive environments.
 - `check-usage`: Show your current GitHub Copilot usage and quota information directly in the terminal (no server required).
 - `debug`: Display diagnostic information including version, runtime details, file paths, and authentication status. Useful for troubleshooting and support.
@@ -161,7 +161,7 @@ The following command line options are available for the `start` command:
 | --rate-limit          | Rate limit in seconds between requests                                                    | none       | -r    |
 | --wait                | Wait instead of error when rate limit is hit                                              | false      | -w    |
 | --github-token        | Provide GitHub token directly (must be generated using the `auth` subcommand)             | none       | -g    |
-| --claude-code         | Generate a command to launch Claude Code with Copilot API config                          | false      | -c    |
+| --claude-code         | Generate a command to launch Claude Code with Claude Switch config                          | false      | -c    |
 | --show-token          | Show GitHub and Copilot tokens on fetch and refresh                                       | false      | none  |
 | --provider            | Provider preset override: `copilot`, `opencode`, `openrouter`, `groq`, `xai`, `nvidia-nim`, `gemini`, `custom` (omit to use interactive startup wizard) | none       | none  |
 | --provider-base-url   | Override provider base URL                                                                | none       | none  |
@@ -192,7 +192,7 @@ When no explicit `--provider*` overrides are passed, `start` launches an interac
 
 Provider and model slot choices are persisted and reused on next startup.
 
-When using `copilot-api switch`, you can choose where Claude env sync is written:
+When using `claude-switch switch`, you can choose where Claude env sync is written:
 - local workspace file (`.claude/settings.local.json`)
 - global user file (`~/.claude/settings.json`)
 
@@ -217,7 +217,7 @@ Startup output is concise by default and shows the configured slot summary (inst
 
 ## API Endpoints
 
-The server exposes several endpoints to interact with the Copilot API. It provides OpenAI-compatible endpoints and now also includes support for Anthropic-compatible endpoints, allowing for greater flexibility with different tools and services.
+The server exposes several endpoints to interact with the Claude Switch. It provides OpenAI-compatible endpoints and now also includes support for Anthropic-compatible endpoints, allowing for greater flexibility with different tools and services.
 
 ### OpenAI Compatible Endpoints
 
@@ -253,55 +253,55 @@ Using with npx:
 
 ```sh
 # Basic usage with start command
-npx copilot-api@latest start
+npx claude-switch@latest start
 
 # One-click OpenCode Zen mode (OpenAI-compatible provider)
-npx copilot-api@latest start --provider opencode --provider-api-key YOUR_OPENCODE_KEY
+npx claude-switch@latest start --provider opencode --provider-api-key YOUR_OPENCODE_KEY
 
 # One-click OpenRouter mode
-npx copilot-api@latest start --provider openrouter --provider-api-key YOUR_OPENROUTER_KEY
+npx claude-switch@latest start --provider openrouter --provider-api-key YOUR_OPENROUTER_KEY
 
 # One-click NVIDIA NIM mode
-npx copilot-api@latest start --provider nvidia-nim --provider-api-key YOUR_NVIDIA_KEY
+npx claude-switch@latest start --provider nvidia-nim --provider-api-key YOUR_NVIDIA_KEY
 
 # One-click Gemini (OpenAI-compatible endpoint) mode
-npx copilot-api@latest start --provider gemini --provider-api-key YOUR_GEMINI_KEY
+npx claude-switch@latest start --provider gemini --provider-api-key YOUR_GEMINI_KEY
 
 # Run on custom port with verbose logging
-npx copilot-api@latest start --port 8080 --verbose
+npx claude-switch@latest start --port 8080 --verbose
 
 # Use with a business plan GitHub account
-npx copilot-api@latest start --account-type business
+npx claude-switch@latest start --account-type business
 
 # Use with an enterprise plan GitHub account
-npx copilot-api@latest start --account-type enterprise
+npx claude-switch@latest start --account-type enterprise
 
 # Enable manual approval for each request
-npx copilot-api@latest start --manual
+npx claude-switch@latest start --manual
 
 # Set rate limit to 30 seconds between requests
-npx copilot-api@latest start --rate-limit 30
+npx claude-switch@latest start --rate-limit 30
 
 # Wait instead of error when rate limit is hit
-npx copilot-api@latest start --rate-limit 30 --wait
+npx claude-switch@latest start --rate-limit 30 --wait
 
 # Provide GitHub token directly
-npx copilot-api@latest start --github-token ghp_YOUR_TOKEN_HERE
+npx claude-switch@latest start --github-token ghp_YOUR_TOKEN_HERE
 
 # Run only the auth flow
-npx copilot-api@latest auth
+npx claude-switch@latest auth
 
 # Run auth flow with verbose logging
-npx copilot-api@latest auth --verbose
+npx claude-switch@latest auth --verbose
 
 # Show your Copilot usage/quota in the terminal (no server needed)
-npx copilot-api@latest check-usage
+npx claude-switch@latest check-usage
 
 # Display debug information for troubleshooting
-npx copilot-api@latest debug
+npx claude-switch@latest debug
 
 # Display debug information in JSON format
-npx copilot-api@latest debug --json
+npx claude-switch@latest debug --json
 
 ```
 
@@ -356,7 +356,7 @@ Provider mode supports per-provider request policies:
 Set via switch wizard (recommended per provider), or with startup override:
 
 ```sh
-npx copilot-api@latest start --provider openrouter --provider-api-key YOUR_KEY --provider-request-handling-mode strict
+npx claude-switch@latest start --provider openrouter --provider-api-key YOUR_KEY --provider-request-handling-mode strict
 ```
 
 ## Using the Usage Viewer
@@ -365,10 +365,10 @@ After starting the server, a URL to the Copilot Usage Dashboard will be displaye
 
 1.  Start the server. For example, using npx:
     ```sh
-    npx copilot-api@latest start
+    npx claude-switch@latest start
     ```
 2.  The server will output a URL to the usage viewer. Copy and paste this URL into your browser. It will look something like this:
-    `https://ericc-ch.github.io/copilot-api?endpoint=http://localhost:4141/usage`
+    `https://ericc-ch.github.io/claude-switch?endpoint=http://localhost:4141/usage`
     - If you use the `start.bat` script on Windows, this page will open automatically.
 
 The dashboard provides a user-friendly interface to view your Copilot usage data:
@@ -378,7 +378,7 @@ The dashboard provides a user-friendly interface to view your Copilot usage data
 - **Usage Quotas**: View a summary of your usage quotas for different services like Chat and Completions, displayed with progress bars for a quick overview.
 - **Detailed Information**: See the full JSON response from the API for a detailed breakdown of all available usage statistics.
 - **URL-based Configuration**: You can also specify the API endpoint directly in the URL using a query parameter. This is useful for bookmarks or sharing links. For example:
-  `https://ericc-ch.github.io/copilot-api?endpoint=http://your-api-server/usage`
+  `https://ericc-ch.github.io/claude-switch?endpoint=http://your-api-server/usage`
 
 ## Using with Claude Code
 
@@ -392,10 +392,10 @@ To get started, run the `start` command with the `--claude-code` flag:
 
 ```sh
 # Copilot Pro backend
-npx copilot-api@latest start --claude-code
+npx claude-switch@latest start --claude-code
 
 # Any OpenAI-compatible provider backend
-npx copilot-api@latest start --provider opencode --provider-api-key YOUR_OPENCODE_KEY --claude-code
+npx claude-switch@latest start --provider opencode --provider-api-key YOUR_OPENCODE_KEY --claude-code
 ```
 
 You will be prompted to select a primary model and a "small, fast" model for background tasks.
@@ -459,7 +459,7 @@ bun run start
 
 ## Stable Global Snapshot (Dev-Safe)
 
-If you actively develop in this repo, your global `copilot-api` command can become linked to the workspace and break when local builds fail.
+If you actively develop in this repo, your global `claude-switch` command can become linked to the workspace and break when local builds fail.
 
 Install a standalone stable snapshot (non-linked global install):
 
@@ -473,12 +473,12 @@ What this does:
 - removes any existing global link/install
 - installs a standalone global copy
 
-After this, `copilot-api` is runnable from any directory and is not affected by ongoing local development changes until you run `npm run stable:install` again.
+After this, `claude-switch` is runnable from any directory and is not affected by ongoing local development changes until you run `npm run stable:install` again.
 
 ## Usage Tips
 
 - To avoid hitting GitHub Copilot's rate limits, you can use the following flags:
   - `--manual`: Enables manual approval for each request, giving you full control over when requests are sent.
-  - `--rate-limit <seconds>`: Enforces a minimum time interval between requests. For example, `copilot-api start --rate-limit 30` will ensure there's at least a 30-second gap between requests.
+  - `--rate-limit <seconds>`: Enforces a minimum time interval between requests. For example, `claude-switch start --rate-limit 30` will ensure there's at least a 30-second gap between requests.
   - `--wait`: Use this with `--rate-limit`. It makes the server wait for the cooldown period to end instead of rejecting the request with an error. This is useful for clients that don't automatically retry on rate limit errors.
 - If you have a GitHub business or enterprise plan account with Copilot, use the `--account-type` flag (e.g., `--account-type business`). See the [official documentation](https://docs.github.com/en/enterprise-cloud@latest/copilot/managing-copilot/managing-github-copilot-in-your-organization/managing-access-to-github-copilot-in-your-organization/managing-github-copilot-access-to-your-organizations-network#configuring-copilot-subscription-based-network-routing-for-your-enterprise-or-organization) for more details.

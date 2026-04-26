@@ -6,7 +6,7 @@
 
 **Architecture:** Apply targeted helper extraction for hard-to-test logic while keeping the existing CLI and handler orchestration stable. Each defect is fixed via TDD with failing tests first, then minimal implementation, then verification.
 
-**Tech Stack:** TypeScript, Bun test runner (bun:test), Hono handlers, Citty CLI commands, existing copilot-api runtime state.
+**Tech Stack:** TypeScript, Bun test runner (bun:test), Hono handlers, Citty CLI commands, existing claude-switch runtime state.
 
 ---
 

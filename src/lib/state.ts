@@ -1,10 +1,18 @@
 import type { ModelsResponse } from "~/services/copilot/get-models"
 import type { ProviderConfig } from "~/lib/provider-config"
 
+export interface CopilotRateLimitState {
+  cooldownUntilMs: number
+  responseBody: string
+  responseHeaders: Record<string, string>
+  sourceEndpoint: "chat/completions" | "responses"
+}
+
 export interface State {
   githubToken?: string
   copilotToken?: string
   provider: ProviderConfig
+  copilotRateLimitState?: CopilotRateLimitState
 
   accountType: string
   models?: ModelsResponse

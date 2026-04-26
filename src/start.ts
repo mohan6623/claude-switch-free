@@ -2062,7 +2062,7 @@ function parseSlotLabel(
 export const start = defineCommand({
   meta: {
     name: "start",
-    description: "Start the Copilot API server",
+    description: "Start the Claude Switch server",
   },
   args: {
     port: {
@@ -2111,7 +2111,7 @@ export const start = defineCommand({
       type: "boolean",
       default: false,
       description:
-        "Generate a command to launch Claude Code with Copilot API config",
+        "Generate a command to launch Claude Code with Claude Switch config",
     },
     "show-token": {
       type: "boolean",

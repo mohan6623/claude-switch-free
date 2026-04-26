@@ -10,9 +10,9 @@ import { switchCommand } from "./switch"
 
 const main = defineCommand({
   meta: {
-    name: "copilot-api",
+    name: "claude-switch",
     description:
-      "A wrapper around GitHub Copilot API to make it OpenAI compatible, making it usable for other tools.",
+      "A wrapper around GitHub Claude Switch to make it OpenAI compatible, making it usable for other tools.",
   },
   subCommands: {
     auth,

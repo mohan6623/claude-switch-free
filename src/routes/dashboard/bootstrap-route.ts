@@ -58,7 +58,7 @@ dashboardBootstrapRoutes.get("/bootstrap", async (c) => {
     return c.json({
       app: {
         mode: "browser",
-        name: "copilot-api-dashboard",
+        name: "claude-switch-dashboard",
       },
       activeProvider: activeProfile
         ? {

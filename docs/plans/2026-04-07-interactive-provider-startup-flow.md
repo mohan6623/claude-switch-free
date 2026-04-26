@@ -6,7 +6,7 @@
 
 **Architecture:** Introduce a persistent startup configuration store under the app data directory and a small startup wizard service that handles provider choice, provider credential setup, model slot selection, and reuse/update decisions. Keep interactive prompt orchestration in startup utilities, while preserving existing request routing and provider config resolution.
 
-**Tech Stack:** TypeScript, Bun test, citty/consola prompts, existing copilot-api runtime state.
+**Tech Stack:** TypeScript, Bun test, citty/consola prompts, existing claude-switch runtime state.
 
 ---
 

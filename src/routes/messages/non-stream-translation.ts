@@ -166,7 +166,7 @@ function handleUserMessage(
  * For GPT models, thinking blocks are stripped because GPT uses an
  * internal reasoning format that doesn't map to Anthropic's thinking blocks.
  * For Claude / Gemini models, thinking blocks are merged into text content
- * since the downstream Copilot API accepts them.
+ * since the downstream Claude Switch accepts them.
  */
 function handleAssistantMessage(
   message: AnthropicAssistantMessage,

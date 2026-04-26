@@ -1,5 +1,5 @@
 {
-  "name": "copilot-api",
+  "name": "claude-switch",
   "version": "0.7.0",
   "description": "Turn GitHub Copilot into OpenAI/Anthropic API compatible server. Usable with Claude Code!",
   "keywords": [
@@ -7,16 +7,16 @@
     "github-copilot",
     "openai-compatible"
   ],
-  "homepage": "https://github.com/ericc-ch/copilot-api",
-  "bugs": "https://github.com/ericc-ch/copilot-api/issues",
+  "homepage": "https://github.com/ericc-ch/claude-switch",
+  "bugs": "https://github.com/ericc-ch/claude-switch/issues",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/ericc-ch/copilot-api.git"
+    "url": "git+https://github.com/ericc-ch/claude-switch.git"
   },
   "author": "Erick Christian <erickchristian48@gmail.com>",
   "type": "module",
   "bin": {
-    "copilot-api": "./dist/main.js"
+    "claude-switch": "./dist/main.js"
   },
   "files": [
     "dist"

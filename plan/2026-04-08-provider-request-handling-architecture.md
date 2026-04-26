@@ -41,7 +41,7 @@ Every provider request path must enforce `maxTotalUpstreamCalls` for a single in
 ## 4. Scope
 ### 4.1 In scope
 - Persist request handling mode per provider profile
-- Expose mode in `copilot-api switch` add/update flows
+- Expose mode in `claude-switch switch` add/update flows
 - Thread mode into runtime provider config
 - Enforce mode in openai-compatible completion loop
 - Add regression tests for strict and non-strict behavior
@@ -110,7 +110,7 @@ Every provider request path must enforce `maxTotalUpstreamCalls` for a single in
 6. Full verification
 
 ## 7. Verification Plan
-Run in `d:/Project/Resume2/copilot-api`:
+Run in `d:/Project/Resume2/claude-switch`:
 1. `bun test tests/create-chat-completions.test.ts`
 2. `bun test tests/startup-config.test.ts`
 3. `bun test`

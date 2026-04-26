@@ -23,7 +23,7 @@ afterEach(() => {
 
 describe("startup config persistence", () => {
   test("loads empty config when file is missing", async () => {
-    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "copilot-api-startup-config-"))
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "claude-switch-startup-config-"))
     PATHS.STARTUP_CONFIG_PATH = path.join(tempDir, "startup-config.json")
 
     const config = await loadStartupConfig()
@@ -36,7 +36,7 @@ describe("startup config persistence", () => {
   })
 
   test("saves and reloads provider profile with model slots", async () => {
-    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "copilot-api-startup-config-"))
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "claude-switch-startup-config-"))
     PATHS.STARTUP_CONFIG_PATH = path.join(tempDir, "startup-config.json")
 
     const initial = await loadStartupConfig()
@@ -67,7 +67,7 @@ describe("startup config persistence", () => {
   })
 
   test("defaults request handling mode to balanced for legacy provider configs", async () => {
-    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "copilot-api-startup-config-"))
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "claude-switch-startup-config-"))
     PATHS.STARTUP_CONFIG_PATH = path.join(tempDir, "startup-config.json")
 
     const legacyConfig = {

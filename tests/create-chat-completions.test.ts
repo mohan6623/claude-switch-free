@@ -12,6 +12,7 @@ function resetStateForTests() {
   state.copilotToken = "test-token"
   state.vsCodeVersion = "1.0.0"
   state.accountType = "individual"
+  state.copilotRateLimitState = undefined
   state.provider = {
     id: "copilot",
     mode: "copilot",
@@ -843,6 +844,73 @@ describe("createChatCompletions core behavior", () => {
     expect(firstChunk.choices?.[0]?.delta?.content).toBe(
       "stream fallback content",
     )
+  })
+
+  test("short-circuits repeated Copilot requests while responses cooldown is active", async () => {
+    const fetchMock = installFetchMock((url) => {
+      if (url.endsWith("/chat/completions")) {
+        return buildUnsupportedApiForModelResponse()
+      }
+
+      if (url.endsWith("/responses")) {
+        return Response.json(
+          {
+            error: {
+              message: "weekly quota exhausted",
+              code: "user_weekly_rate_limited",
+              type: "rate_limit_error",
+            },
+          },
+          {
+            status: 429,
+            headers: {
+              "x-ratelimit-user-retry-after": "3600",
+              "x-ratelimit-exceeded": "user_weekly_rate_limited",
+            },
+          },
+        )
+      }
+
+      throw new Error(`Unexpected request URL: ${url}`)
+    })
+
+    const payload: ChatCompletionsPayload = {
+      model: "gpt-5.3-codex",
+      messages: [{ role: "user", content: "hello" }],
+    }
+
+    let firstError: unknown
+    try {
+      await createChatCompletions(payload)
+    } catch (error) {
+      firstError = error
+    }
+
+    expect(firstError).toBeInstanceOf(HTTPError)
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+
+    let secondError: unknown
+    try {
+      await createChatCompletions(payload)
+    } catch (error) {
+      secondError = error
+    }
+
+    expect(secondError).toBeInstanceOf(HTTPError)
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+
+    if (!(secondError instanceof HTTPError)) {
+      throw new Error("Expected local cooldown short-circuit HTTPError")
+    }
+
+    expect(secondError.response.status).toBe(429)
+    expect(secondError.response.headers.get("retry-after")).toBeTruthy()
+    expect(
+      secondError.response.headers.get("x-ratelimit-user-retry-after"),
+    ).toBeTruthy()
+
+    const cachedBody = await secondError.response.clone().text()
+    expect(cachedBody).toContain("user_weekly_rate_limited")
   })
 
   test("routes Gemini provider through native generateContent endpoint", async () => {

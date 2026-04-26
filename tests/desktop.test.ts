@@ -19,7 +19,7 @@ const originalCopilotToken = state.copilotToken
 describe("desktop routes", () => {
   beforeEach(async () => {
     const tempDir = await fs.mkdtemp(
-      path.join(os.tmpdir(), "copilot-api-desktop-test-"),
+      path.join(os.tmpdir(), "claude-switch-desktop-test-"),
     )
 
     PATHS.STARTUP_CONFIG_PATH = path.join(tempDir, "startup-config.json")

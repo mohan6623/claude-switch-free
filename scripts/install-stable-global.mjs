@@ -60,17 +60,17 @@ function readPackFileName(packOutput) {
 
 function uninstallGlobalIfPresent() {
   try {
-    runStreaming("npm", ["uninstall", "-g", "copilot-api"])
+    runStreaming("npm", ["uninstall", "-g", "claude-switch"])
   } catch {
     // Global package may not exist yet; ignore.
   }
 }
 
 function assertStandaloneInstall() {
-  const tree = run("npm", ["ls", "-g", "copilot-api", "--depth=0"])
+  const tree = run("npm", ["ls", "-g", "claude-switch", "--depth=0"])
 
   if (tree.includes("->")) {
-    warn("Global install still looks linked to a local folder. Run `npm unlink -g copilot-api` and retry.")
+    warn("Global install still looks linked to a local folder. Run `npm unlink -g claude-switch` and retry.")
     console.log(tree.trim())
     process.exitCode = 1
     return
@@ -102,7 +102,7 @@ function main() {
     runStreaming("npm", ["install", "-g", tarballPath])
 
     assertStandaloneInstall()
-    info("Stable snapshot install complete. You can run `copilot-api` from any directory.")
+    info("Stable snapshot install complete. You can run `claude-switch` from any directory.")
   } finally {
     if (fs.existsSync(tarballPath)) {
       fs.unlinkSync(tarballPath)

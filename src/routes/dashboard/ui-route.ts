@@ -8,7 +8,7 @@ dashboardUiRoutes.get("/", (c) => {
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>copilot-api dashboard</title>
+<title>claude-switch dashboard</title>
 <link rel="stylesheet" href="/dashboard/app.css" />
 </head>
 <body>
@@ -19,7 +19,7 @@ dashboardUiRoutes.get("/", (c) => {
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
           <path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"/>
         </svg>
-        <h1>copilot-api</h1>
+        <h1>claude-switch</h1>
       </div>
       <div class="header-status">
         <span class="status-indicator" id="connection-status"></span>
@@ -380,24 +380,146 @@ function slotIcon(slotId) {
   return entry ? entry.icon : "M"
 }
 
-async function updateSlot(select, slotId, model) {
-  const previousValue = select.dataset.previousValue || select.value
-  select.disabled = true
+async function showTargetSelectionModal() {
+  return new Promise((resolve) => {
+    const overlay = document.createElement("div")
+    overlay.className = "modal-overlay"
+
+    const modal = document.createElement("div")
+    modal.className = "card"
+    modal.style.padding = "24px"
+    modal.style.width = "400px"
+    modal.style.maxWidth = "90vw"
+
+    const title = document.createElement("h2")
+    title.textContent = "Select Write Target"
+    title.style.marginBottom = "16px"
+    title.style.fontSize = "16px"
+
+    const targetSelect = document.createElement("select")
+    targetSelect.className = "slot-select"
+    targetSelect.style.marginBottom = "16px"
+
+    const globalOpt = document.createElement("option")
+    globalOpt.value = "global"
+    globalOpt.textContent = "Global (~/.claude/settings.json)"
+
+    const localOpt = document.createElement("option")
+    localOpt.value = "local"
+    localOpt.textContent = "Local (Workspace)"
+    targetSelect.append(globalOpt, localOpt)
+
+    const fileContainer = document.createElement("div")
+    fileContainer.style.display = "none"
+    fileContainer.style.marginBottom = "16px"
+
+    const fileSelect = document.createElement("select")
+    fileSelect.className = "slot-select"
+    fileContainer.append(fileSelect)
+
+    const actions = document.createElement("div")
+    actions.style.display = "flex"
+    actions.style.gap = "8px"
+    actions.style.justifyContent = "flex-end"
+
+    const cancelBtn = document.createElement("button")
+    cancelBtn.className = "btn"
+    cancelBtn.style.background = "var(--surface-raised)"
+    cancelBtn.style.color = "var(--text)"
+    cancelBtn.textContent = "Cancel"
+
+    const applyBtn = document.createElement("button")
+    applyBtn.className = "btn btn-primary"
+    applyBtn.textContent = "Apply"
+
+    actions.append(cancelBtn, applyBtn)
+    modal.append(title, targetSelect, fileContainer, actions)
+    overlay.append(modal)
+    document.body.append(overlay)
+
+    let candidatesLoaded = false
+    let candidatesList = []
+
+    targetSelect.addEventListener("change", async () => {
+      if (targetSelect.value === "local") {
+        fileContainer.style.display = "block"
+        if (!candidatesLoaded) {
+          try {
+            const data = await apiFetch("/dashboard/api/candidates")
+            candidatesList = data.candidates || []
+            fileSelect.innerHTML = ""
+            if (candidatesList.length === 0) {
+              const opt = document.createElement("option")
+              opt.value = ""
+              opt.textContent = "No local config found, will use default."
+              fileSelect.append(opt)
+            } else {
+              candidatesList.forEach(c => {
+                const opt = document.createElement("option")
+                opt.value = c.path
+                opt.textContent = c.path + (c.isDefault ? " (default)" : "")
+                if (c.isDefault) opt.selected = true
+                fileSelect.append(opt)
+              })
+            }
+            candidatesLoaded = true
+          } catch(e) {
+            fileSelect.innerHTML = "<option value=''>Error loading paths</option>"
+          }
+        }
+      } else {
+        fileContainer.style.display = "none"
+      }
+    })
+
+    const cleanup = () => overlay.remove()
+
+    cancelBtn.addEventListener("click", () => {
+      cleanup()
+      resolve(null)
+    })
+
+    applyBtn.addEventListener("click", () => {
+      cleanup()
+      resolve({
+        target: targetSelect.value,
+        localPath: targetSelect.value === "local" ? fileSelect.value : undefined
+      })
+    })
+  })
+}
+
+async function updateSlot(input, slotId, prevValue, statusEl) {
+  const model = input.value.trim()
+  if (!model) return
+
+  const targetSelection = await showTargetSelectionModal()
+  if (!targetSelection) {
+    input.value = prevValue
+    return
+  }
+
+  input.disabled = true
+  statusEl.textContent = "Saving..."
 
   try {
-    await apiFetch("/dashboard/api/slots/" + slotId, {
+    const res = await apiFetch("/dashboard/api/slots/" + slotId, {
       method: "PATCH",
       headers: {
         "content-type": "application/json",
       },
-      body: JSON.stringify({ model }),
+      body: JSON.stringify({ model, target: targetSelection.target, localPath: targetSelection.localPath }),
     })
 
-    select.dataset.previousValue = model
-  } catch {
-    select.value = previousValue
+    input.dataset.previousValue = model
+    statusEl.textContent = res.syncPath ? "Synced: " + res.syncPath : "Saved."
+    setTimeout(() => { statusEl.textContent = "" }, 5000)
+  } catch (err) {
+    input.value = input.dataset.previousValue || prevValue
+    statusEl.textContent = "Failed."
+    setTimeout(() => { statusEl.textContent = "" }, 3000)
   } finally {
-    select.disabled = false
+    input.disabled = false
   }
 }
 
@@ -413,6 +535,19 @@ function renderSlots(config) {
 
   const slots = config?.slots || {}
   const models = Array.isArray(config?.availableModels) ? config.availableModels : []
+
+  let datalist = document.getElementById("models-datalist")
+  if (!datalist) {
+    datalist = document.createElement("datalist")
+    datalist.id = "models-datalist"
+    document.body.append(datalist)
+  }
+  datalist.innerHTML = ""
+  models.forEach(m => {
+    const opt = document.createElement("option")
+    opt.value = m
+    datalist.append(opt)
+  })
 
   for (const definition of SLOT_DEFINITIONS) {
     const card = document.createElement("div")
@@ -431,42 +566,52 @@ function renderSlots(config) {
 
     header.append(icon, name)
 
-    const select = document.createElement("select")
-    select.className = "slot-select"
+    const inputContainer = document.createElement("div")
+    inputContainer.style.display = "flex"
+    inputContainer.style.gap = "8px"
+    inputContainer.style.alignItems = "center"
 
+    const input = document.createElement("input")
+    input.className = "slot-select"
+    input.setAttribute("list", "models-datalist")
     const selectedModel = slots[definition.id] || ""
+    input.value = selectedModel
+    input.dataset.previousValue = selectedModel
+    input.placeholder = "Search model..."
 
-    for (const model of models) {
-      const option = document.createElement("option")
-      option.value = model
-      option.textContent = model
-      option.selected = model === selectedModel
-      select.append(option)
-    }
+    const setBtn = document.createElement("button")
+    setBtn.className = "btn btn-primary"
+    setBtn.textContent = "Set"
+    setBtn.style.padding = "10px 16px"
 
-    if (models.length === 0) {
-      const option = document.createElement("option")
-      option.value = ""
-      option.textContent = "No models available"
-      option.selected = true
-      select.append(option)
-      select.disabled = true
-    } else {
-      select.dataset.previousValue = selectedModel
-      select.addEventListener("change", () => {
-        const nextModel = select.value
-        void updateSlot(select, definition.id, nextModel)
-      })
-    }
+    inputContainer.append(input, setBtn)
 
-    card.append(header, select)
+    const statusText = document.createElement("div")
+    statusText.style.fontSize = "12px"
+    statusText.style.color = "var(--text-secondary)"
+    statusText.style.marginTop = "8px"
+    statusText.style.minHeight = "18px"
+    statusText.style.wordBreak = "break-all"
+
+    setBtn.addEventListener("click", () => {
+      void updateSlot(input, definition.id, selectedModel, statusText)
+    })
+
+    card.append(header, inputContainer, statusText)
     els.slotsGrid.append(card)
   }
 }
 
 async function loadSlotsPanel() {
-  const config = await apiFetch("/dashboard/api/config")
-  renderSlots(config)
+  try {
+    const config = await apiFetch("/dashboard/api/config")
+    renderSlots(config)
+  } catch (err) {
+    if (els.slotsGrid) {
+      els.slotsGrid.innerHTML = ""
+      els.slotsGrid.append(makePlaceholder("Failed to load slots."))
+    }
+  }
 }
 
 function renderChartEmpty(message) {
@@ -1226,6 +1371,19 @@ body {
   .dashboard-grid { grid-template-columns: 1fr; }
   .header-content { flex-direction: column; align-items: flex-start; }
   .slots-grid { grid-template-columns: 1fr; }
+}
+
+.modal-overlay {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: rgba(0, 0, 0, 0.7);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
 }
 `, 200, { "content-type": "text/css; charset=utf-8" })
 })

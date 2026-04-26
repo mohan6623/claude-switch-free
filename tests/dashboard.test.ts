@@ -15,7 +15,7 @@ const originalModels = state.models
 
 describe("dashboard routes", () => {
   beforeEach(async () => {
-    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "copilot-api-dashboard-test-"))
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "claude-switch-dashboard-test-"))
     PATHS.STARTUP_CONFIG_PATH = path.join(tempDir, "startup-config.json")
     PATHS.ANALYTICS_DIR = path.join(tempDir, "analytics")
 
@@ -121,7 +121,7 @@ describe("dashboard routes", () => {
 
     expect(response.status).toBe(200)
     const html = await response.text()
-    expect(html).toContain("copilot-api dashboard")
+    expect(html).toContain("claude-switch dashboard")
     expect(html).toContain("Live Request Log")
     expect(html).toContain("/dashboard/app.js")
   })

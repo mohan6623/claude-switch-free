@@ -275,7 +275,7 @@ export async function syncClaudeSettingsPath(
   }
 }
 
-function resolveClaudeSettingsLocalCandidatePaths(
+export function resolveClaudeSettingsLocalCandidatePaths(
   startDir: string,
 ): Array<string> {
   const candidates: Array<string> = []

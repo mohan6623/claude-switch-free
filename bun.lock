@@ -2,7 +2,7 @@
   "lockfileVersion": 1,
   "workspaces": {
     "": {
-      "name": "copilot-api",
+      "name": "claude-switch",
       "dependencies": {
         "citty": "^0.1.6",
         "clipboardy": "^5.0.0",
