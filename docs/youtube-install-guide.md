@@ -1,75 +1,58 @@
-# YouTube Install Guide
+# YouTube Install Guide: Claude Switch Free
 
 ## Video Title Ideas
+- Use Claude Code FOR FREE with Copilot/OpenRouter Proxy!
+- Stop Paying for Claude Code! Run Claude Switch Free in 2 Minutes
+- Claude Code Free Proxy: Step-by-Step Installation
 
-- Run Claude Switch Free on Any Computer in 2 Minutes
-- Free-First Claude Code Proxy Setup: No Node, No npm, No Build Step
-- Install claude-switch-free From GitHub Releases
+## Step 1: Explain What It Is (0:00 - 0:30)
+**Visual:** Show the GitHub repository (`https://github.com/mohan6623/claude-switch-free`)
+**Script:** "Hey everyone! Claude Code is amazing, but the API costs can add up fast. Today I'm going to show you an open-source proxy we built called **Claude Switch Free**. It lets you run Claude Code using your existing GitHub Copilot subscription, or cheap/free providers via OpenRouter or Gemini—all routed through a single local server. Let's get it installed!"
 
-## Short Video Flow
+## Step 2: Choose Your Installation Method (0:30 - 1:30)
 
-1. Show the GitHub repository:
-   `https://github.com/mohan6623/claude-switch-free`
-2. Explain the goal:
-   "This gives you a local OpenAI/Anthropic-compatible proxy for Claude Code and other tools, with free-first provider support and Copilot support."
-3. Mention the requirement:
-   "You only need one backend credential: either a provider API key or GitHub Copilot."
-4. Install the binary for the operating system.
-5. Run the first-time setup:
-   `claude-switch start`
-6. Change models later:
-   `claude-switch switch`
-7. Show the local dashboard:
-   `http://localhost:4141/dashboard`
+### Method A: For Developers (Using npm/npx)
+**Visual:** Open a terminal and run the `npx` command.
+**Script:** "If you already have Node.js installed, this is the easiest way. Just open your terminal and run:"
+```sh
+npx claude-switch-free start
+```
+"This will automatically download and start the proxy."
 
-## Windows Commands
-
+### Method B: Standalone File (No Node.js needed)
+**Visual:** Show the GitHub "Releases" page, download the `.exe`, and run it.
+**Script:** "If you don't have Node installed, no problem. Head over to the GitHub Releases page. Download the standalone executable for Windows, macOS, or Linux. For Windows, download `claude-switch-free-win.exe`, double click it, or run it from your terminal like this:"
 ```powershell
-Invoke-WebRequest -Uri "https://github.com/mohan6623/claude-switch-free/releases/latest/download/claude-switch-windows-x64.exe" -OutFile "$env:USERPROFILE\claude-switch.exe"
-& "$env:USERPROFILE\claude-switch.exe" start
+.\claude-switch-free-win.exe start
 ```
 
-Optional shortcut after download:
+## Step 3: First-Time Setup (1:30 - 2:30)
+**Visual:** Terminal showing the setup wizard prompts.
+**Script:** "When you run it for the first time, the wizard will ask you to configure your first slot. You can set up GitHub Copilot as a free proxy, or drop in an OpenRouter API key. Just follow the prompts. Once you finish, the server will start on `http://localhost:4141`."
 
+## Step 4: Using it with Claude Code (2:30 - 3:30)
+**Visual:** Side-by-side terminal. One running the proxy, the other running Claude Code.
+**Script:** "Now that the proxy is running, let's connect Claude Code to it! In a new terminal, tell Claude Code to use our local proxy by setting these environment variables:"
+
+**For Windows (PowerShell):**
 ```powershell
-& "$env:USERPROFILE\claude-switch.exe" switch
+$env:ANTHROPIC_BASE_URL="http://localhost:4141"
+$env:ANTHROPIC_API_KEY="sk-proxy"
+npx @anthropic-ai/claude-code
 ```
 
-## Linux Commands
-
+**For Mac/Linux:**
 ```sh
-curl -L -o claude-switch https://github.com/mohan6623/claude-switch-free/releases/latest/download/claude-switch-linux-x64
-chmod +x claude-switch
-./claude-switch start
+export ANTHROPIC_BASE_URL="http://localhost:4141"
+export ANTHROPIC_API_KEY="sk-proxy"
+npx @anthropic-ai/claude-code
 ```
+**Script:** "And boom! Claude Code is now communicating through your free proxy. You can use it as much as you want without worrying about direct Anthropic API billing!"
 
-## macOS Commands
-
+## Step 5: Managing Models and Dashboard (3:30 - 4:00)
+**Visual:** Show the `switch` command and the web dashboard.
+**Script:** "If you ever want to change models, just open a new terminal and run:"
 ```sh
-curl -L -o claude-switch https://github.com/mohan6623/claude-switch-free/releases/latest/download/claude-switch-macos
-chmod +x claude-switch
-./claude-switch start
+npx claude-switch-free switch
 ```
-
-## Suggested Script
-
-Today I am showing how to install `claude-switch-free`, a local proxy that lets Claude Code and OpenAI or Anthropic-compatible clients talk to multiple backends through one local server.
-
-The easiest install path is the standalone GitHub release binary. You do not need to clone the repo, install dependencies, or build the project.
-
-Download the binary for your operating system, run `claude-switch start`, and follow the setup wizard. You can use a GitHub Copilot subscription, or add a provider API key such as OpenRouter, Gemini-compatible providers, or a custom OpenAI-compatible endpoint.
-
-After setup, the daily commands are simple:
-
-```sh
-claude-switch start
-claude-switch switch
-```
-
-The server exposes OpenAI-compatible and Anthropic-compatible endpoints locally, and the dashboard is available at:
-
-```text
-http://localhost:4141/dashboard
-```
-
-Always keep your provider API keys private, and check each provider's usage limits and terms.
+"Or open your browser to `http://localhost:4141/dashboard` to see your usage metrics. And that's it! The link to the GitHub repo is in the description. Don't forget to star the repo if this saved you money. See you next time!"
