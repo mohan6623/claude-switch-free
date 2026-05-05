@@ -32,22 +32,13 @@ npx claude-switch-free start
 
 ## Step 4: Using it with Claude Code (2:30 - 3:30)
 **Visual:** Side-by-side terminal. One running the proxy, the other running Claude Code.
-**Script:** "Now that the proxy is running, let's connect Claude Code to it! In a new terminal, tell Claude Code to use our local proxy by setting these environment variables:"
+**Script:** "Now that the proxy is running, let's connect Claude Code to it! The best part about Claude Switch Free is that it automatically injects the proxy configuration into your global Claude Code settings (`~/.claude/settings.json`). This means you don't have to mess with any environment variables or weird commands."
 
-**For Windows (PowerShell):**
-```powershell
-$env:ANTHROPIC_BASE_URL="http://localhost:4141"
-$env:ANTHROPIC_API_KEY="sk-proxy"
-npx @anthropic-ai/claude-code
-```
-
-**For Mac/Linux:**
+**Visual:** Open a completely fresh terminal and type:
 ```sh
-export ANTHROPIC_BASE_URL="http://localhost:4141"
-export ANTHROPIC_API_KEY="sk-proxy"
 npx @anthropic-ai/claude-code
 ```
-**Script:** "And boom! Claude Code is now communicating through your free proxy. You can use it as much as you want without worrying about direct Anthropic API billing!"
+**Script:** "Just open a new terminal, run Claude Code normally, and boom! It is now communicating through your free proxy. You can code as much as you want without worrying about direct Anthropic API billing!"
 
 ## Step 5: Managing Models and Dashboard (3:30 - 4:00)
 **Visual:** Show the `switch` command and the web dashboard.
