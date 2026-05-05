@@ -12,6 +12,7 @@ import {
   buildClaudeSettingsPromptMessage,
   buildClaudeSettingsSkipMessage,
   inspectClaudeSettingsLocal,
+  inspectClaudeSettingsGlobal,
   loadClaudeModelSlotsForTarget,
   syncClaudeSettingsGlobal,
   syncClaudeSettingsLocal,
@@ -342,20 +343,17 @@ export async function runServer(options: RunServerOptions): Promise<void> {
 
     const claudeEnv = buildClaudeModelEnv(serverUrl, selectedSlots)
 
-    const settingsInspection = await inspectClaudeSettingsLocal(process.cwd())
+    const settingsInspection = await inspectClaudeSettingsGlobal()
 
     if (settingsInspection.status === "missing") {
       consola.info(
-        `No existing local Claude settings found. A new settings file will be created at ${settingsInspection.path}.`,
+        `No existing global Claude settings found. A new settings file will be created at ${settingsInspection.path}.`,
       )
     }
 
     let syncResult: { updated: boolean; path?: string }
     if (settingsInspection.status === "missing") {
-      syncResult = await syncClaudeSettingsPath(
-        settingsInspection.path,
-        claudeEnv,
-      )
+      syncResult = await syncClaudeSettingsGlobal(claudeEnv)
     } else if (
       settingsInspection.status === "loaded"
       && settingsInspection.hasUnrelatedSettings
@@ -369,10 +367,7 @@ export async function runServer(options: RunServerOptions): Promise<void> {
         consola.warn(buildClaudeSettingsSkipMessage(settingsInspection))
         syncResult = { updated: false }
       } else {
-        syncResult = await syncClaudeSettingsPath(
-          settingsInspection.path,
-          claudeEnv,
-        )
+        syncResult = await syncClaudeSettingsGlobal(claudeEnv)
       }
     } else if (settingsInspection.status === "invalid-json") {
       const shouldOverwrite = await promptConfirm(
@@ -384,17 +379,14 @@ export async function runServer(options: RunServerOptions): Promise<void> {
         consola.warn(buildClaudeSettingsSkipMessage(settingsInspection))
         syncResult = { updated: false }
       } else {
-        syncResult = await syncClaudeSettingsPath(
-          settingsInspection.path,
-          claudeEnv,
-        )
+        syncResult = await syncClaudeSettingsGlobal(claudeEnv)
       }
     } else {
-      syncResult = await syncClaudeSettingsLocal(process.cwd(), claudeEnv)
+      syncResult = await syncClaudeSettingsGlobal(claudeEnv)
     }
 
     if (syncResult.updated && syncResult.path) {
-      consola.info(`Synced Claude settings: ${syncResult.path}`)
+      consola.info(`Synced global Claude settings: ${syncResult.path}`)
     }
 
     const command = generateEnvScript(claudeEnv, "claude")

@@ -257,7 +257,7 @@ export function buildClaudeModelEnv(serverUrl: string, slots: ModelSlots) {
 
   return {
     ANTHROPIC_BASE_URL: serverUrl,
-    ANTHROPIC_AUTH_TOKEN: "dummy",
+    ANTHROPIC_API_KEY: "sk-proxy",
     ...slotEnv,
   }
 }

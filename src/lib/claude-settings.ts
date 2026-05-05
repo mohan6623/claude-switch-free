@@ -60,6 +60,43 @@ export function hasUnrelatedClaudeSettings(input: unknown): boolean {
   )
 }
 
+export async function inspectClaudeSettingsGlobal(
+  options: { homeDir?: string } = {},
+): Promise<ClaudeSettingsInspection> {
+  const settingsPath = resolveClaudeSettingsGlobalPath(options.homeDir)
+
+  try {
+    const raw = await fs.readFile(settingsPath, "utf8")
+    if (!raw.trim()) {
+      return {
+        status: "loaded",
+        path: settingsPath,
+        hasUnrelatedSettings: false,
+      }
+    }
+
+    const parsed = JSON.parse(raw) as unknown
+    return {
+      status: "loaded",
+      path: settingsPath,
+      hasUnrelatedSettings: hasUnrelatedClaudeSettings(parsed),
+    }
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code
+    if (code === "ENOENT") {
+      return {
+        status: "missing",
+        path: settingsPath,
+      }
+    }
+
+    return {
+      status: "invalid-json",
+      path: settingsPath,
+    }
+  }
+}
+
 export async function inspectClaudeSettingsLocal(
   startDir: string,
 ): Promise<ClaudeSettingsInspection> {
@@ -181,14 +218,21 @@ export function mergeClaudeSettingsJson(
     }
   }
 
+  const result: Record<string, unknown> = { ...source }
+
   for (const [key, value] of Object.entries(envPatch)) {
-    mergedEnv[key] = value
+    if (key === "ANTHROPIC_BASE_URL") {
+      result.customApiUrl = value
+    } else if (key === "ANTHROPIC_API_KEY" || key === "ANTHROPIC_AUTH_TOKEN") {
+      result.customApiKey = value
+    } else {
+      mergedEnv[key] = value
+    }
   }
 
-  return {
-    ...source,
-    env: mergedEnv,
-  }
+  result.env = mergedEnv
+
+  return result as ClaudeSettingsJson
 }
 
 export async function resolveClaudeSettingsLocalPath(

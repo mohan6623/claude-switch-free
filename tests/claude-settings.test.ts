@@ -38,7 +38,7 @@ describe("claude settings sync", () => {
 
     expect(merged.outputStyle).toBe("Explanatory")
     expect(merged.env.ANTHROPIC_AUTH_TOKEN).toBe("existing-token")
-    expect(merged.env.ANTHROPIC_BASE_URL).toBe("http://localhost:4141")
+    expect(merged.customApiUrl).toBe("http://localhost:4141")
     expect(merged.env.ANTHROPIC_MODEL).toBe(
       "cpapi-route:openrouter::qwen%2Fqwen3.6-plus%3Afree",
     )
@@ -119,12 +119,13 @@ describe("claude settings sync", () => {
 
     const after = JSON.parse(await fs.readFile(settingsPath)) as {
       env: Record<string, string>
+      customApiUrl?: string
       outputStyle?: string
     }
 
     expect(after.outputStyle).toBe("Explanatory")
     expect(after.env.ANTHROPIC_AUTH_TOKEN).toBe("keep-me")
-    expect(after.env.ANTHROPIC_BASE_URL).toBe("http://localhost:4141")
+    expect(after.customApiUrl).toBe("http://localhost:4141")
     expect(after.env.ANTHROPIC_MODEL).toBe(
       "cpapi-route:copilot::claude-sonnet-4.5",
     )
@@ -268,12 +269,13 @@ describe("claude settings sync", () => {
 
     const after = JSON.parse(await fs.readFile(settingsPath)) as {
       env: Record<string, string>
+      customApiUrl?: string
       outputStyle?: string
     }
 
     expect(after.outputStyle).toBe("Explanatory")
     expect(after.env.ANTHROPIC_AUTH_TOKEN).toBe("keep-me")
-    expect(after.env.ANTHROPIC_BASE_URL).toBe("http://localhost:4141")
+    expect(after.customApiUrl).toBe("http://localhost:4141")
     expect(after.env.ANTHROPIC_MODEL).toBe(
       "cpapi-route:openrouter::qwen%2Fqwen3.6-plus%3Afree",
     )
@@ -352,7 +354,7 @@ describe("claude settings sync", () => {
 
     const result = await syncClaudeSettingsPath(settingsPath, {
       ANTHROPIC_BASE_URL: "http://localhost:4141",
-      ANTHROPIC_AUTH_TOKEN: "dummy",
+      ANTHROPIC_API_KEY: "sk-proxy",
       ANTHROPIC_MODEL: "cpapi-route:copilot::claude-sonnet-4.5",
     })
 
@@ -360,8 +362,9 @@ describe("claude settings sync", () => {
 
     const after = JSON.parse(await fs.readFile(settingsPath)) as {
       env: Record<string, string>
+      customApiUrl?: string
     }
-    expect(after.env.ANTHROPIC_BASE_URL).toBe("http://localhost:4141")
-    expect(after.env.ANTHROPIC_AUTH_TOKEN).toBe("dummy")
+    expect(after.customApiUrl).toBe("http://localhost:4141")
+    expect(after.customApiKey).toBe("sk-proxy")
   })
 })
