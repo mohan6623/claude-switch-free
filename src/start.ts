@@ -22,6 +22,7 @@ import { ensurePaths } from "./lib/paths"
 import {
   normalizeProviderRequestHandlingMode,
   resolveProviderConfig,
+  resolveProviderConfigFromProfile,
   type ProviderRequestHandlingMode,
   type ResolveProviderOptions,
 } from "./lib/provider-config"
@@ -47,10 +48,14 @@ import {
   buildSearchStatusLabel,
   buildClaudeModelEnv,
   buildClaudeModelSlotEnv,
+  buildCloudflareModelSearchUrl,
+  extractCloudflareModelIds,
   getFeaturedModelCandidates,
+  getCloudflareFallbackModelIds,
   getCopilotModelIds,
   getProviderPresets,
   hasCompleteModelSlots,
+  isCloudflareWorkersAiProvider,
   normalizeModelSlots,
   summarizeModelSlots,
   type ModelSlots,
@@ -120,6 +125,25 @@ const PROVIDER_ACTION_DELETE_MODELS = "Delete model mappings"
 const FALLBACK_MODEL = "qwen/qwen3.6-plus:free"
 const DOUBLE_ESCAPE_WINDOW_MS = 850
 const DEFAULT_CLAUDE_SETTINGS_SYNC_TARGET: ClaudeSettingsSyncTarget = "local"
+const CHANGE_MODEL_MAPPINGS_ACTION = "Change model mappings"
+const SAVE_AND_EXIT_ACTION = "Save and exit"
+const EXIT_ACTION = "Exit"
+
+export function buildSwitchConfigurationActions(): Array<string> {
+  return [
+    PROVIDER_ACTION_ADD,
+    PROVIDER_ACTION_UPDATE,
+    CHANGE_MODEL_MAPPINGS_ACTION,
+    PROVIDER_ACTION_DELETE_MODELS,
+    PROVIDER_ACTION_DELETE,
+    SAVE_AND_EXIT_ACTION,
+    EXIT_ACTION,
+  ]
+}
+
+export function resolveSwitchConfigurationDefaultAction(): string {
+  return CHANGE_MODEL_MAPPINGS_ACTION
+}
 
 class PromptBackError extends Error {
   constructor() {
@@ -426,7 +450,7 @@ async function resolveSavedStartupSelection(): Promise<
   StartupSelection | undefined
 > {
   const startupConfig = await loadStartupConfig()
-  const active = getActiveProviderProfile(startupConfig)
+  const active = resolveUsableStartupProfile(startupConfig)
 
   if (!active) {
     return undefined
@@ -447,6 +471,32 @@ async function resolveSavedStartupSelection(): Promise<
       providerRequestHandlingMode: active.requestHandlingMode,
     },
   }
+}
+
+function resolveUsableStartupProfile(
+  startupConfig: Awaited<ReturnType<typeof loadStartupConfig>>,
+): ProviderProfile | undefined {
+  const active = getActiveProviderProfile(startupConfig)
+  const orderedProfiles = [
+    ...(active ? [active] : []),
+    ...startupConfig.providers.filter((profile) => profile.id !== active?.id),
+  ]
+
+  for (const profile of orderedProfiles) {
+    try {
+      resolveProviderConfigFromProfile(profile, {
+        defaultModel: profile.modelSlots?.defaultModel,
+        smallModel: profile.modelSlots?.haikuModel,
+      })
+      return profile
+    } catch (error) {
+      consola.warn(
+        `Skipping provider ${profile.label} (${profile.id}): ${error instanceof Error ? error.message : String(error)}`,
+      )
+    }
+  }
+
+  return undefined
 }
 
 export async function runSwitchConfiguration(): Promise<void> {
@@ -520,18 +570,8 @@ export async function runSwitchConfiguration(): Promise<void> {
     try {
       action = await promptSelect(
         `Switch configuration mode (active provider: ${activeLabel})`,
-        [
-          PROVIDER_ACTION_CONTINUE,
-          PROVIDER_ACTION_ADD,
-          PROVIDER_ACTION_UPDATE,
-          PROVIDER_ACTION_SWITCH,
-          "Change model mappings",
-          PROVIDER_ACTION_DELETE_MODELS,
-          PROVIDER_ACTION_DELETE,
-          "Save and exit",
-          "Exit",
-        ],
-        PROVIDER_ACTION_CONTINUE,
+        buildSwitchConfigurationActions(),
+        resolveSwitchConfigurationDefaultAction(),
         { spacing: "major" },
       )
     } catch (error) {
@@ -568,7 +608,7 @@ export async function runSwitchConfiguration(): Promise<void> {
       throw error
     }
 
-    if (action === "Change model mappings") {
+    if (action === CHANGE_MODEL_MAPPINGS_ACTION) {
       let result
       try {
         result = await runChangeModelDraft(workingConfig, sessionSlotSource)
@@ -743,7 +783,7 @@ export async function runSwitchConfiguration(): Promise<void> {
       continue
     }
 
-    if (action === "Save and exit") {
+    if (action === SAVE_AND_EXIT_ACTION) {
       if (dirty) {
         await persistSwitchConfigWithTarget(workingConfig, syncTarget)
         consola.success("Saved switch configuration.")
@@ -1105,10 +1145,7 @@ async function runAddProviderFlow(
     updatedAt: new Date().toISOString(),
   }
 
-  const updatedConfig = setActiveProvider(
-    upsertProviderProfile(startupConfig, updatedProfile),
-    updatedProfile.id,
-  )
+  const updatedConfig = upsertProviderProfile(startupConfig, updatedProfile)
   await persistSwitchConfigWithTarget(updatedConfig, syncTarget)
 
   consola.info(
@@ -1196,10 +1233,7 @@ async function runUpdateProviderFlow(
     updatedAt: new Date().toISOString(),
   }
 
-  const updatedConfig = setActiveProvider(
-    upsertProviderProfile(startupConfig, updatedProfile),
-    updatedProfile.id,
-  )
+  const updatedConfig = upsertProviderProfile(startupConfig, updatedProfile)
   await persistSwitchConfigWithTarget(updatedConfig, syncTarget)
 
   consola.info(
@@ -1334,11 +1368,7 @@ async function promptProviderChoiceForAdd(
   const options: Array<SearchableOption | string> = [
     ...presets.map((preset) => ({
       value: `preset:${preset.id}`,
-      label: buildProviderDisplayLabel({
-        label: preset.label,
-        baseUrl: preset.baseUrl,
-      }),
-      description: "Preset provider",
+      label: preset.label,
       searchText: `${preset.id} ${preset.label} ${preset.baseUrl}`,
     })),
     ADD_CUSTOM_PROVIDER_LABEL,
@@ -1389,7 +1419,7 @@ async function promptProviderChoiceForAdd(
     return {
       id: preset.id,
       label: preset.label,
-      baseUrl: preset.baseUrl,
+      baseUrl: await resolvePresetBaseUrl(preset),
       apiKeyUrl: preset.apiKeyUrl,
       isPreset: true,
       existingProfile: getProviderProfile(
@@ -1400,6 +1430,20 @@ async function promptProviderChoiceForAdd(
   }
 
   throw new Error(`Unsupported provider option "${selected}"`)
+}
+
+async function resolvePresetBaseUrl(
+  preset: ReturnType<typeof getProviderPresets>[number],
+): Promise<string> {
+  if (!preset.requiresCloudflareAccountId) {
+    return preset.baseUrl
+  }
+
+  consola.info(
+    "Find your Cloudflare account ID in Workers & Pages > Overview, or open https://dash.cloudflare.com/?to=/:account/workers-and-pages",
+  )
+  const accountId = await promptText("Enter Cloudflare account ID")
+  return preset.baseUrl.replace("{account_id}", accountId.trim())
 }
 
 async function promptExistingProviderProfile(
@@ -1588,6 +1632,21 @@ async function fetchProviderModels(
     }
   }
 
+  if (isCloudflareWorkersAiProvider(providerId, baseUrl)) {
+    const cloudflareModels = await fetchCloudflareWorkersAiModels(
+      baseUrl,
+      apiKey,
+    )
+    if (cloudflareModels.length > 0) {
+      return cloudflareModels
+    }
+
+    consola.warn(
+      "Could not load Cloudflare model list. Using built-in Cloudflare model suggestions.",
+    )
+    return getCloudflareFallbackModelIds()
+  }
+
   try {
     const response = await fetch(`${baseUrl}/models`, {
       headers: {
@@ -1618,6 +1677,47 @@ async function fetchProviderModels(
       ),
     ]
   } catch {
+    return []
+  }
+}
+
+async function fetchCloudflareWorkersAiModels(
+  baseUrl: string,
+  apiKey: string,
+): Promise<Array<string>> {
+  if (!apiKey.trim()) {
+    return []
+  }
+
+  try {
+    const modelSearchUrl = buildCloudflareModelSearchUrl(baseUrl)
+    const response = await fetch(modelSearchUrl, {
+      headers: {
+        accept: "application/json",
+        authorization: `Bearer ${apiKey}`,
+      },
+    })
+
+    if (!response.ok) {
+      const errorText = await response.text().catch(() => "")
+      consola.warn(
+        `Cloudflare model search failed (${response.status}). Make sure the API token has Workers AI Read permission.${errorText ? ` ${errorText.slice(0, 240)}` : ""}`,
+      )
+      return []
+    }
+
+    const models = extractCloudflareModelIds(await response.json())
+    if (models.length === 0) {
+      consola.warn(
+        "Cloudflare model search returned no text-generation models.",
+      )
+    }
+
+    return models
+  } catch (error) {
+    consola.warn(
+      `Cloudflare model search could not run: ${error instanceof Error ? error.message : String(error)}`,
+    )
     return []
   }
 }
@@ -1761,15 +1861,15 @@ function deriveModelSlotsFromProviderPreferences(): ModelSlots | undefined {
 function hasExplicitProviderConfiguration(options: RunServerOptions): boolean {
   return Boolean(
     options.provider
-    || options.providerBaseUrl
-    || options.providerApiKey
-    || options.providerModel
-    || options.providerSmallModel
-    || process.env.PROVIDER
-    || process.env.PROVIDER_BASE_URL
-    || process.env.PROVIDER_API_KEY
-    || process.env.PROVIDER_MODEL
-    || process.env.PROVIDER_SMALL_MODEL,
+      || options.providerBaseUrl
+      || options.providerApiKey
+      || options.providerModel
+      || options.providerSmallModel
+      || process.env.PROVIDER
+      || process.env.PROVIDER_BASE_URL
+      || process.env.PROVIDER_API_KEY
+      || process.env.PROVIDER_MODEL
+      || process.env.PROVIDER_SMALL_MODEL,
   )
 }
 

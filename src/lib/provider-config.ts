@@ -206,8 +206,19 @@ export function resolveProviderConfig(
     })
   }
 
+  if (customBaseUrl && customApiKey) {
+    return openAICompatibleConfig({
+      id: requestedProvider,
+      baseUrl: customBaseUrl,
+      apiKey: customApiKey,
+      model: providerModel,
+      smallModel: providerSmallModel,
+      requestHandlingMode: providerRequestHandlingMode,
+    })
+  }
+
   throw new Error(
-    `Unsupported provider \"${requestedProvider}\". Use one of: copilot, opencode, openrouter, groq, xai, nvidia-nim, gemini, custom`,
+    `Unsupported provider \"${requestedProvider}\". Use a saved provider profile, custom provider, or one of: copilot, opencode, openrouter, groq, xai, nvidia-nim, gemini`,
   )
 }
 
@@ -227,10 +238,8 @@ export function resolveProviderConfigFromProfile(
     }
   }
 
-  const provider = profile.isPreset ? profile.id : "custom"
-
   return resolveProviderConfig({
-    provider,
+    provider: profile.id,
     providerBaseUrl: profile.baseUrl,
     providerApiKey: profile.apiKey,
     providerModel: models?.defaultModel,

@@ -5,8 +5,12 @@ import {
   buildSearchStatusLabel,
   buildClaudeModelEnv,
   buildClaudeModelSlotEnv,
+  buildCloudflareModelSearchUrl,
+  extractCloudflareAccountId,
+  extractCloudflareModelIds,
   filterModelsBySearch,
   getCopilotModelIds,
+  getCloudflareFallbackModelIds,
   getFeaturedModelCandidates,
   getProviderPresets,
   hasCompleteModelSlots,
@@ -28,6 +32,75 @@ describe("startup wizard helpers", () => {
     expect(openrouter?.baseUrl).toBe("https://openrouter.ai/api/v1")
     expect(gemini?.baseUrl).toContain("googleapis.com")
     expect(presets.some((p) => p.id === "vertex-ai")).toBe(false)
+  })
+
+  test("sorts common provider presets by beginner-friendly priority", () => {
+    const presets = getProviderPresets()
+
+    expect(presets.slice(0, 5).map((preset) => preset.id)).toEqual([
+      "openrouter",
+      "opencode",
+      "gemini",
+      "nvidia-nim",
+      "cloudflare",
+    ])
+    expect(presets.slice(0, 5).map((preset) => preset.label)).toEqual([
+      "OpenRouter",
+      "OpenCode",
+      "Google",
+      "NVIDIA",
+      "Cloudflare",
+    ])
+  })
+
+  test("builds Cloudflare model search URL from OpenAI-compatible base URL", () => {
+    expect(
+      buildCloudflareModelSearchUrl(
+        "https://api.cloudflare.com/client/v4/accounts/abc123/ai/v1",
+      ),
+    ).toBe(
+      "https://api.cloudflare.com/client/v4/accounts/abc123/ai/models/search?per_page=100&hide_experimental=true&task=Text%20Generation",
+    )
+  })
+
+  test("extracts Cloudflare account id from provider base URL", () => {
+    expect(
+      extractCloudflareAccountId(
+        "https://api.cloudflare.com/client/v4/accounts/abc123/ai/v1",
+      ),
+    ).toBe("abc123")
+  })
+
+  test("extracts chat-capable Cloudflare model ids from model search payload", () => {
+    const models = extractCloudflareModelIds({
+      success: true,
+      result: [
+        {
+          id: "@cf/meta/llama-3.1-8b-instruct",
+          task: { name: "Text Generation" },
+        },
+        {
+          name: "@cf/baai/bge-base-en-v1.5",
+          task: { name: "Text Embeddings" },
+        },
+        {
+          name: "@cf/openai/gpt-oss-20b",
+          task: "text-generation",
+        },
+      ],
+    })
+
+    expect(models).toEqual([
+      "@cf/meta/llama-3.1-8b-instruct",
+      "@cf/openai/gpt-oss-20b",
+    ])
+  })
+
+  test("provides Cloudflare fallback chat model ids when live model search is unavailable", () => {
+    expect(getCloudflareFallbackModelIds()).toContain(
+      "@cf/meta/llama-3.1-8b-instruct",
+    )
+    expect(getCloudflareFallbackModelIds()).toContain("@cf/openai/gpt-oss-20b")
   })
 
   test("normalizes partial slots from default model", () => {

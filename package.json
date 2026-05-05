@@ -1,5 +1,5 @@
 {
-  "name": "claude-switch",
+  "name": "claude-switch-free",
   "version": "0.7.0",
   "description": "Turn GitHub Copilot into OpenAI/Anthropic API compatible server. Usable with Claude Code!",
   "keywords": [
@@ -16,13 +16,17 @@
   "author": "Erick Christian <erickchristian48@gmail.com>",
   "type": "module",
   "bin": {
-    "claude-switch": "./dist/main.js"
+    "claude-switch-free": "./dist/main.js"
   },
   "files": [
     "dist"
   ],
   "scripts": {
     "build": "tsdown",
+    "build:exe:win": "bun build ./src/main.ts --compile --target=bun-windows-x64 --outfile dist/claude-switch-free-windows.exe",
+    "build:exe:mac": "bun build ./src/main.ts --compile --target=bun-darwin-arm64 --outfile dist/claude-switch-free-mac",
+    "build:exe:linux": "bun build ./src/main.ts --compile --target=bun-linux-x64 --outfile dist/claude-switch-free-linux",
+    "build:exe:all": "bun run build:exe:win && bun run build:exe:mac && bun run build:exe:linux",
     "dev": "bun run --watch ./src/main.ts start",
     "knip": "knip-bun",
     "lint": "eslint --cache",

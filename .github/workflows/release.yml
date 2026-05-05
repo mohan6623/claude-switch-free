@@ -1,8 +1,8 @@
 name: Release
 
 permissions:
-  id-token: write
   contents: write
+  id-token: write
 
 on:
   push:
@@ -10,7 +10,42 @@ on:
       - "v*"
 
 jobs:
+  build-binaries:
+    name: Build ${{ matrix.artifact }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact: claude-switch-linux-x64
+          - os: macos-latest
+            artifact: claude-switch-macos
+          - os: windows-latest
+            artifact: claude-switch-windows-x64.exe
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Build standalone binary
+        run: bun build --compile ./src/main.ts --outfile dist/${{ matrix.artifact }}
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/${{ matrix.artifact }}
+          if-no-files-found: error
+
   release:
+    needs: build-binaries
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -21,6 +56,18 @@ jobs:
         with:
           bun-version: latest
 
-      - run: bunx changelogithub
+      - name: Download binaries
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Generate release notes
+        run: bunx changelogithub
         env:
-          GITHUB_TOKEN: ${{secrets.GITHUB_TOKEN}}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Attach binaries to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release-assets/*

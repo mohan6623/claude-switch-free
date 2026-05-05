@@ -12,6 +12,7 @@ export interface ProviderPreset {
   label: string
   baseUrl: string
   apiKeyUrl: string
+  requiresCloudflareAccountId?: boolean
 }
 
 export interface ProviderDisplayInput {
@@ -22,16 +23,35 @@ export interface ProviderDisplayInput {
 
 const PROVIDER_PRESETS: Array<ProviderPreset> = [
   {
-    id: "opencode",
-    label: "OpenCode Zen",
-    baseUrl: "https://opencode.ai/zen/v1",
-    apiKeyUrl: "https://opencode.ai/settings/keys",
-  },
-  {
     id: "openrouter",
     label: "OpenRouter",
     baseUrl: "https://openrouter.ai/api/v1",
     apiKeyUrl: "https://openrouter.ai/keys",
+  },
+  {
+    id: "opencode",
+    label: "OpenCode",
+    baseUrl: "https://opencode.ai/zen/v1",
+    apiKeyUrl: "https://opencode.ai/settings/keys",
+  },
+  {
+    id: "gemini",
+    label: "Google",
+    baseUrl: "https://generativelanguage.googleapis.com/v1beta/openai",
+    apiKeyUrl: "https://aistudio.google.com/app/apikey",
+  },
+  {
+    id: "nvidia-nim",
+    label: "NVIDIA",
+    baseUrl: "https://integrate.api.nvidia.com/v1",
+    apiKeyUrl: "https://build.nvidia.com/settings/api-keys",
+  },
+  {
+    id: "cloudflare",
+    label: "Cloudflare",
+    baseUrl: "https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/v1",
+    apiKeyUrl: "https://dash.cloudflare.com/profile/api-tokens",
+    requiresCloudflareAccountId: true,
   },
   {
     id: "groq",
@@ -44,18 +64,6 @@ const PROVIDER_PRESETS: Array<ProviderPreset> = [
     label: "xAI",
     baseUrl: "https://api.x.ai/v1",
     apiKeyUrl: "https://console.x.ai/team/api-keys",
-  },
-  {
-    id: "nvidia-nim",
-    label: "NVIDIA NIM",
-    baseUrl: "https://integrate.api.nvidia.com/v1",
-    apiKeyUrl: "https://build.nvidia.com/settings/api-keys",
-  },
-  {
-    id: "gemini",
-    label: "Google Gemini (OpenAI-compatible)",
-    baseUrl: "https://generativelanguage.googleapis.com/v1beta/openai",
-    apiKeyUrl: "https://aistudio.google.com/app/apikey",
   },
 ]
 
@@ -73,6 +81,14 @@ const FEATURED_MODEL_PATTERNS = [
   "nemotron",
   "deepseek",
   "llama",
+]
+
+const CLOUDFLARE_FALLBACK_MODEL_IDS = [
+  "@cf/meta/llama-3.1-8b-instruct",
+  "@cf/openai/gpt-oss-20b",
+  "@cf/openai/gpt-oss-120b",
+  "@cf/qwen/qwen1.5-14b-chat-awq",
+  "@cf/mistral/mistral-7b-instruct-v0.2-lora",
 ]
 
 export function getProviderPresets(): Array<ProviderPreset> {
@@ -181,6 +197,61 @@ export function buildProviderDisplayLabel(input: ProviderDisplayInput): string {
   return `${input.label}${active} (${host})`
 }
 
+export function isCloudflareWorkersAiProvider(
+  providerId: string,
+  baseUrl: string,
+): boolean {
+  return (
+    providerId.trim().toLowerCase() === "cloudflare"
+    || baseUrl.toLowerCase().includes("api.cloudflare.com/client/v4/accounts/")
+  )
+}
+
+export function extractCloudflareAccountId(baseUrl: string): string | undefined {
+  const match = baseUrl.match(/\/accounts\/([^/]+)\/ai(?:\/|$)/i)
+  return match?.[1] ? decodeURIComponent(match[1]) : undefined
+}
+
+export function buildCloudflareModelSearchUrl(baseUrl: string): string {
+  const accountId = extractCloudflareAccountId(baseUrl)
+  if (!accountId) {
+    throw new Error("Cloudflare account ID is missing from provider base URL")
+  }
+
+  return `https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(accountId)}/ai/models/search?per_page=100&hide_experimental=true&task=Text%20Generation`
+}
+
+export function getCloudflareFallbackModelIds(): Array<string> {
+  return [...CLOUDFLARE_FALLBACK_MODEL_IDS]
+}
+
+export function extractCloudflareModelIds(payload: unknown): Array<string> {
+  if (!payload || typeof payload !== "object") {
+    return []
+  }
+
+  const result = (payload as { result?: unknown }).result
+  if (!Array.isArray(result)) {
+    return []
+  }
+
+  return [
+    ...new Set(
+      result
+        .filter(isCloudflareChatModel)
+        .map((model) => {
+          const item = model as { id?: unknown; name?: unknown }
+          return typeof item.id === "string" ? item.id
+            : typeof item.name === "string" ? item.name
+            : undefined
+        })
+        .filter((id): id is string => typeof id === "string" && id.length > 0)
+        .filter((id) => id.startsWith("@cf/"))
+        .sort((a, b) => a.localeCompare(b)),
+    ),
+  ]
+}
+
 export function buildClaudeModelEnv(serverUrl: string, slots: ModelSlots) {
   const slotEnv = buildClaudeModelSlotEnv(slots)
 
@@ -226,6 +297,52 @@ function getProviderHost(baseUrl: string): string {
   } catch {
     return baseUrl
   }
+}
+
+function isCloudflareChatModel(model: unknown): boolean {
+  if (!model || typeof model !== "object") {
+    return false
+  }
+
+  const item = model as {
+    task?: unknown
+    tags?: unknown
+    type?: unknown
+  }
+  const taskLabel = extractCloudflareTaskLabel(item.task)
+  const haystack = [
+    taskLabel,
+    typeof item.type === "string" ? item.type : "",
+    Array.isArray(item.tags) ? item.tags.join(" ") : "",
+  ]
+    .join(" ")
+    .toLowerCase()
+
+  if (!haystack.trim()) {
+    return true
+  }
+
+  return (
+    haystack.includes("text-generation")
+    || haystack.includes("text generation")
+    || haystack.includes("chat")
+    || haystack.includes("llm")
+  )
+}
+
+function extractCloudflareTaskLabel(task: unknown): string {
+  if (typeof task === "string") {
+    return task
+  }
+
+  if (task && typeof task === "object") {
+    const taskObject = task as { name?: unknown; id?: unknown; label?: unknown }
+    return [taskObject.name, taskObject.id, taskObject.label]
+      .filter((value): value is string => typeof value === "string")
+      .join(" ")
+  }
+
+  return ""
 }
 
 function rankModels(models: Array<string>): Array<{ model: string; score: number }> {
